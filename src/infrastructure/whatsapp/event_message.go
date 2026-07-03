@@ -412,6 +412,50 @@ func buildOtherMessageTypes(msg *waE2E.Message, payload map[string]any) {
 	if orderMessage := msg.GetOrderMessage(); orderMessage != nil {
 		payload["order"] = orderMessage
 	}
+
+	if poll := buildWebhookPollPayload(msg); poll != nil {
+		payload["poll"] = poll
+	}
+}
+
+// buildWebhookPollPayload flattens the poll-creation variants (V1-V6) into a
+// single {question, options} map. V4 wraps the real message in a
+// FutureProofMessage envelope, so it is unwrapped before lookup. Poll votes
+// (PollUpdateMessage) are intentionally excluded: they carry encrypted vote
+// data and have no rendering in the WhatsApp chat itself.
+func buildWebhookPollPayload(msg *waE2E.Message) map[string]any {
+	if msg == nil {
+		return nil
+	}
+	poll := msg.GetPollCreationMessage()
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV2()
+	}
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV3()
+	}
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV5()
+	}
+	if poll == nil {
+		poll = msg.GetPollCreationMessageV6()
+	}
+	if poll == nil {
+		if fp := msg.GetPollCreationMessageV4(); fp != nil && fp.GetMessage() != nil {
+			return buildWebhookPollPayload(fp.GetMessage())
+		}
+		return nil
+	}
+	options := make([]string, 0, len(poll.GetOptions()))
+	for _, opt := range poll.GetOptions() {
+		if name := opt.GetOptionName(); name != "" {
+			options = append(options, name)
+		}
+	}
+	return map[string]any{
+		"question": poll.GetName(),
+		"options":  options,
+	}
 }
 
 func buildWebhookContactPayload(contact *waE2E.ContactMessage) webhookContactPayload {

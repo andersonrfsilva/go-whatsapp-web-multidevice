@@ -401,11 +401,10 @@ func buildChatwootMessageContent(data map[string]any, isGroup bool, fromName str
 		logrus.Infof("Chatwoot: Found %s attachment at %s", field, path)
 	}
 
-	// Handle empty content
-	if content == "" && len(attachments) == 0 {
-		content = "(Unsupported message type)"
-		logrus.Info("Chatwoot: Message content is empty/unsupported, using placeholder")
-	}
+	// Empty content with no attachments is left as-is: the caller skips the
+	// message instead of posting a placeholder. These payloads come from events
+	// that have no rendering in the WhatsApp chat either (poll votes, protocol
+	// messages), so a Chatwoot entry would appear next to nothing in WhatsApp.
 
 	// For group messages with attachments but no text, still prepend sender name
 	if prefixGroupSender && content == "" && len(attachments) > 0 {
@@ -482,6 +481,33 @@ func chatwootMessageTypeFromPayload(data map[string]any) string {
 }
 
 func extractStructuredMessageContent(data map[string]any) string {
+	if poll, ok := data["poll"].(map[string]any); ok && poll != nil {
+		question, _ := poll["question"].(string)
+		var options []string
+		switch raw := poll["options"].(type) {
+		case []string:
+			options = raw
+		case []any:
+			for _, o := range raw {
+				if s, ok := o.(string); ok && s != "" {
+					options = append(options, s)
+				}
+			}
+		}
+		var sb strings.Builder
+		sb.WriteString("📊 Poll")
+		if question != "" {
+			sb.WriteString(": ")
+			sb.WriteString(question)
+		}
+		for _, opt := range options {
+			sb.WriteString("\n• ")
+			sb.WriteString(opt)
+		}
+		return sb.String()
+	}
+
+
 	if contact, ok := data["contact"]; ok && contact != nil {
 		if name, phone, ok := extractContactDetails(contact); ok {
 			return utils.FormatContactSummary(name, phone, false)
@@ -945,6 +971,10 @@ func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventNam
 		}
 	default:
 		content, attachments = buildChatwootMessageContent(data, info.IsGroup, info.FromName)
+		if content == "" && len(attachments) == 0 {
+			logrus.Infof("Chatwoot: Skipping %s with no renderable content", eventName)
+			return nil
+		}
 		if id, _ := data["id"].(string); id != "" {
 			msgOpts.SourceID = "WAID:" + id
 		}

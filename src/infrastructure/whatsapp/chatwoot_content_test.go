@@ -451,8 +451,8 @@ func TestBuildChatwootMessageContent(t *testing.T) {
 			if len(atts) != 0 {
 				t.Fatalf("expected no attachment for url-only %s, got %v", field, atts)
 			}
-			if content != "(Unsupported message type)" {
-				t.Fatalf("expected placeholder when only url present for %s, got %q", field, content)
+			if content != "" {
+				t.Fatalf("expected empty content when only url present for %s (caller skips), got %q", field, content)
 			}
 		})
 	}
@@ -465,10 +465,25 @@ func TestBuildChatwootMessageContent(t *testing.T) {
 		}
 	})
 
-	t.Run("no body and no attachments yields placeholder", func(t *testing.T) {
+	t.Run("no body and no attachments yields empty content for caller to skip", func(t *testing.T) {
 		content, atts := buildChatwootMessageContent(map[string]any{}, false, "")
-		if content != "(Unsupported message type)" {
-			t.Fatalf("expected placeholder, got %q", content)
+		if content != "" {
+			t.Fatalf("expected empty content, got %q", content)
+		}
+		if len(atts) != 0 {
+			t.Fatalf("expected no attachments, got %v", atts)
+		}
+	})
+
+	t.Run("poll payload renders question and options", func(t *testing.T) {
+		content, atts := buildChatwootMessageContent(map[string]any{
+			"poll": map[string]any{
+				"question": "Melhor dia?",
+				"options":  []string{"Sábado", "Domingo"},
+			},
+		}, false, "")
+		if content != "📊 Poll: Melhor dia?\n• Sábado\n• Domingo" {
+			t.Fatalf("unexpected poll content: %q", content)
 		}
 		if len(atts) != 0 {
 			t.Fatalf("expected no attachments, got %v", atts)
