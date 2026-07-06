@@ -925,6 +925,12 @@ func ExtractMedia(ctx context.Context, client *whatsmeow.Client, storageLocation
 	if displayName == "" {
 		displayName = GenerateMediaFilename(mediaKind, strings.TrimPrefix(extension, "."), extractedMedia.Caption)
 	}
+	// A sender-supplied document filename may have no extension (e.g. "report");
+	// re-apply the MIME-resolved extension so downstream Content-Type detection
+	// (filepath.Ext) classifies the file correctly instead of application/octet-stream.
+	if extension != "" && filepath.Ext(displayName) == "" {
+		displayName += extension
+	}
 
 	// The timestamp+uuid prefix keeps the path unique even when two messages
 	// resolve to the same display name (e.g. two uncaptioned images
