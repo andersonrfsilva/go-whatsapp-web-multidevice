@@ -210,6 +210,17 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 		oriImagePath   string
 	)
 
+	defer func() {
+		if len(deletedItems) == 0 {
+			return
+		}
+		go func() {
+			if errDelete := utils.RemoveFile(0, deletedItems...); errDelete != nil {
+				logrus.Warnf("SendImage: failed to delete temp files: %v", errDelete)
+			}
+		}()
+	}()
+
 	if request.ImageURL != nil && *request.ImageURL != "" {
 		// Download image from URL
 		imageData, fileName, err := utils.DownloadImageFromURL(*request.ImageURL)
@@ -340,12 +351,6 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 		caption = request.Caption
 	}
 	ts, err := service.wrapSendMessage(ctx, client, dataWaRecipient, msg, caption)
-	go func() {
-		errDelete := utils.RemoveFile(0, deletedItems...)
-		if errDelete != nil {
-			fmt.Println("error when deleting picture: ", errDelete)
-		}
-	}()
 	if err != nil {
 		return response, err
 	}
