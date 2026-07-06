@@ -482,12 +482,12 @@ func BuildForwardMessageFromStorage(message *domainChatStorage.Message, opts For
 	}
 
 	var (
-		mediaURL       string
-		directPath     string
-		mediaKey       []byte
-		fileSHA256     []byte
-		fileEncSHA256  []byte
-		fileLength     uint64
+		mediaURL      string
+		directPath    string
+		mediaKey      []byte
+		fileSHA256    []byte
+		fileEncSHA256 []byte
+		fileLength    uint64
 	)
 
 	if opts.Upload != nil {
@@ -870,6 +870,24 @@ func sanitizeFilenameComponent(name string) string {
 	return name
 }
 
+// mediaDisplayName picks the human-readable filename for a downloaded media
+// file: the sender's own document filename when present, otherwise a generated
+// type+caption name. It guarantees the result carries the resolved extension so
+// downstream Content-Type detection (filepath.Ext) classifies the file
+// correctly instead of defaulting to application/octet-stream — this is why a
+// document whose sender-supplied name has no extension (e.g. "report") still
+// gets the MIME-resolved suffix appended.
+func mediaDisplayName(originalFilename, mediaKind, caption, extension string) string {
+	displayName := originalFilename
+	if displayName == "" {
+		displayName = GenerateMediaFilename(mediaKind, strings.TrimPrefix(extension, "."), caption)
+	}
+	if extension != "" && filepath.Ext(displayName) == "" {
+		displayName += extension
+	}
+	return displayName
+}
+
 // ExtractMedia is a helper function to extract media from whatsapp
 func ExtractMedia(ctx context.Context, client *whatsmeow.Client, storageLocation string, mediaFile whatsmeow.DownloadableMessage) (extractedMedia ExtractedMedia, err error) {
 	if mediaFile == nil {
@@ -915,22 +933,7 @@ func ExtractMedia(ctx context.Context, client *whatsmeow.Client, storageLocation
 
 	extension := determineMediaExtension(originalFilename, extractedMedia.MimeType)
 
-	// Prefer the sender's own filename (documents are the one WhatsApp media
-	// type that carries one); otherwise fall back to a descriptive
-	// type+caption name. Either way this becomes the on-disk filename's
-	// readable part, so Chatwoot (which shows the attachment's basename) and
-	// any static media browsing display something recognizable instead of a
-	// bare UUID.
-	displayName := originalFilename
-	if displayName == "" {
-		displayName = GenerateMediaFilename(mediaKind, strings.TrimPrefix(extension, "."), extractedMedia.Caption)
-	}
-	// A sender-supplied document filename may have no extension (e.g. "report");
-	// re-apply the MIME-resolved extension so downstream Content-Type detection
-	// (filepath.Ext) classifies the file correctly instead of application/octet-stream.
-	if extension != "" && filepath.Ext(displayName) == "" {
-		displayName += extension
-	}
+	displayName := mediaDisplayName(originalFilename, mediaKind, extractedMedia.Caption, extension)
 
 	// The timestamp+uuid prefix keeps the path unique even when two messages
 	// resolve to the same display name (e.g. two uncaptioned images

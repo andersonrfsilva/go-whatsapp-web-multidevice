@@ -135,6 +135,55 @@ func TestSanitizeFilenameComponentCapsLength(t *testing.T) {
 	}
 }
 
+func TestMediaDisplayName(t *testing.T) {
+	tests := []struct {
+		name             string
+		originalFilename string
+		mediaKind        string
+		caption          string
+		extension        string
+		wantSuffix       string
+		wantNotContain   string
+	}{
+		{
+			// The regression this test guards: a document whose sender-supplied
+			// filename has no extension must still end up with the resolved one,
+			// otherwise Chatwoot renders it as application/octet-stream.
+			name:             "ExtensionlessDocumentGetsExtension",
+			originalFilename: "report",
+			mediaKind:        "document",
+			extension:        ".pdf",
+			wantSuffix:       "report.pdf",
+		},
+		{
+			name:             "DocumentWithExtensionNotDoubled",
+			originalFilename: "invoice.pdf",
+			mediaKind:        "document",
+			extension:        ".pdf",
+			wantSuffix:       "invoice.pdf",
+			wantNotContain:   ".pdf.pdf",
+		},
+		{
+			name:       "GeneratedNameStillCarriesExtension",
+			mediaKind:  "image",
+			extension:  ".jpg",
+			wantSuffix: ".jpg",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mediaDisplayName(tt.originalFilename, tt.mediaKind, tt.caption, tt.extension)
+			if !strings.HasSuffix(got, tt.wantSuffix) {
+				t.Fatalf("mediaDisplayName() = %q, want suffix %q", got, tt.wantSuffix)
+			}
+			if tt.wantNotContain != "" && strings.Contains(got, tt.wantNotContain) {
+				t.Fatalf("mediaDisplayName() = %q, must not contain %q", got, tt.wantNotContain)
+			}
+		})
+	}
+}
+
 func TestExtractPhoneFromVCard(t *testing.T) {
 	tests := []struct {
 		name  string
