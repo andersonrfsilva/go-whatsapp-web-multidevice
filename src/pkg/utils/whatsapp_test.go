@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -60,6 +61,76 @@ func TestDetermineMediaExtension(t *testing.T) {
 				t.Fatalf("determineMediaExtension() = %q, want %q", got, tt.wantSuffix)
 			}
 		})
+	}
+}
+
+func TestSanitizeFilenameComponent(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "PlainName",
+			input: "invoice.pdf",
+			want:  "invoice.pdf",
+		},
+		{
+			name:  "SpacesAndParens",
+			input: "Invoice Final (copy).pdf",
+			want:  "Invoice_Final_copy_.pdf",
+		},
+		{
+			name:  "PathTraversalUnix",
+			input: "../../etc/passwd",
+			want:  "passwd",
+		},
+		{
+			name: "PathTraversalWindowsSeparator",
+			// Backslash isn't a path separator on this platform, so
+			// filepath.Base leaves it in place; the character allowlist
+			// still neutralizes it (replaced with "_") rather than letting
+			// it ride through into the generated path unescaped.
+			input: `..\..\secrets.txt`,
+			want:  "_.._secrets.txt",
+		},
+		{
+			name:  "DotDotOnly",
+			input: "..",
+			want:  "file",
+		},
+		{
+			name:  "EmptyAfterSanitizing",
+			input: "...",
+			want:  "file",
+		},
+		{
+			name:  "LeadingDotsStripped",
+			input: "...hidden.pdf",
+			want:  "hidden.pdf",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeFilenameComponent(tt.input)
+			if got != tt.want {
+				t.Fatalf("sanitizeFilenameComponent(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeFilenameComponentCapsLength(t *testing.T) {
+	// A name far longer than any real filesystem allows for a single path
+	// component must be truncated, keeping the extension intact.
+	longName := strings.Repeat("a", 300) + ".pdf"
+	got := sanitizeFilenameComponent(longName)
+	if len(got) > 100 {
+		t.Fatalf("sanitizeFilenameComponent() len = %d, want <= 100", len(got))
+	}
+	if !strings.HasSuffix(got, ".pdf") {
+		t.Fatalf("sanitizeFilenameComponent() = %q, want suffix .pdf", got)
 	}
 }
 

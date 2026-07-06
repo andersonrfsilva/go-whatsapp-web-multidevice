@@ -657,7 +657,14 @@ func syncMessageToChatwoot(cw *chatwoot.Client, info *chatwootContactInfo, conte
 	if info.IsFromMe {
 		messageType = "outgoing"
 	}
-	msgID, err := cw.CreateMessage(conversation.ID, content, messageType, attachments, opts)
+	// Paths here already carry a readable basename (see utils.ExtractMedia), so
+	// no separate display FileName is needed - the local path's basename is
+	// what createMessageWithAttachments falls back to.
+	cwAttachments := make([]chatwoot.MessageAttachment, len(attachments))
+	for i, path := range attachments {
+		cwAttachments[i] = chatwoot.MessageAttachment{Path: path}
+	}
+	msgID, err := cw.CreateMessage(conversation.ID, content, messageType, cwAttachments, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create message: %w", err)
 	}
