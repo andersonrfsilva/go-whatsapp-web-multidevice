@@ -535,7 +535,12 @@ func isEventWhitelistedForChatwoot(eventName string) bool {
 	return false
 }
 
-func buildReactionChatwootContent(data map[string]any, fromName string) string {
+// buildReactionChatwootContent renders a WhatsApp reaction event into a
+// Chatwoot note. reactedPreview is a short excerpt of the message that was
+// reacted to (empty when it could not be resolved from local chat storage);
+// with a preview the note quotes the original message, otherwise it falls
+// back to referencing the raw WhatsApp message id.
+func buildReactionChatwootContent(data map[string]any, fromName, reactedPreview string) string {
 	reaction, _ := data["reaction"].(string)
 	reactedMessageID, _ := data["reacted_message_id"].(string)
 
@@ -544,6 +549,13 @@ func buildReactionChatwootContent(data map[string]any, fromName string) string {
 		actor = fromName
 	} else if from, ok := data["from"].(string); ok && from != "" {
 		actor = utils.ExtractPhoneFromJID(from)
+	}
+
+	if reactedPreview != "" {
+		if reaction == "" {
+			return fmt.Sprintf("%s removed a reaction from “%s”", actor, reactedPreview)
+		}
+		return fmt.Sprintf("%s reacted %s to “%s”", actor, reaction, reactedPreview)
 	}
 
 	if reactedMessageID != "" {
@@ -557,6 +569,81 @@ func buildReactionChatwootContent(data map[string]any, fromName string) string {
 		return fmt.Sprintf("%s removed a reaction", actor)
 	}
 	return fmt.Sprintf("%s reacted %s", actor, reaction)
+}
+
+const reactedMessagePreviewMaxRunes = 80
+
+// reactedMessagePreview resolves the reacted-to message from local chat
+// storage and returns a short one-line excerpt for the Chatwoot note. Media
+// messages without a caption fall back to their type/filename. Returns ""
+// when the message is not stored locally, so the caller keeps the id-based
+// fallback text.
+func reactedMessagePreview(deviceID string, repo domainChatStorage.IChatStorageRepository, messageID string) string {
+	if repo == nil || messageID == "" {
+		return ""
+	}
+
+	var (
+		msg *domainChatStorage.Message
+		err error
+	)
+	if deviceID != "" {
+		msg, err = repo.GetMessageByIDAndDevice(deviceID, messageID)
+	} else {
+		msg, err = repo.GetMessageByID(messageID)
+	}
+	if err != nil {
+		logrus.Warnf("Chatwoot: Failed to load reacted message %s: %v", messageID, err)
+		return ""
+	}
+	if msg == nil {
+		return ""
+	}
+
+	preview := strings.TrimSpace(msg.Content)
+	if preview == "" && msg.MediaType != "" {
+		if filename := strings.TrimSpace(msg.Filename); filename != "" {
+			preview = fmt.Sprintf("(%s: %s)", msg.MediaType, filename)
+		} else {
+			preview = "(" + msg.MediaType + ")"
+		}
+	}
+
+	return oneLineExcerpt(preview, reactedMessagePreviewMaxRunes)
+}
+
+// oneLineExcerpt collapses whitespace/newlines into single spaces and truncates
+// to maxRunes (appending an ellipsis), so quoted excerpts stay on one line.
+func oneLineExcerpt(s string, maxRunes int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if runes := []rune(s); len(runes) > maxRunes {
+		s = string(runes[:maxRunes]) + "…"
+	}
+	return s
+}
+
+// buildChatwootReplyAttributes threads a WhatsApp reply onto the message it
+// quotes. It always sets in_reply_to_external_id (resolves in Chatwoot when the
+// quoted message carries a WAID source_id, i.e. contact messages mirrored by
+// the forwarder). Agent-authored messages have no WAID source_id, so when a
+// stored link maps the quoted WhatsApp id to a Chatwoot message id, the native
+// in_reply_to is set as well. Returns the attributes and whether a link
+// resolved (callers keep a quoted-text fallback only when it did not).
+func buildChatwootReplyAttributes(deviceID string, linkRepo domainChatStorage.IChatStorageRepository, repliedToID string) (map[string]any, bool) {
+	attrs := map[string]any{"in_reply_to_external_id": "WAID:" + repliedToID}
+	if linkRepo == nil || deviceID == "" {
+		return attrs, false
+	}
+	link, err := linkRepo.GetChatwootMessageLinkByWhatsAppID(deviceID, repliedToID)
+	if err != nil {
+		logrus.Warnf("Chatwoot: Failed to resolve quoted message link for %s: %v", repliedToID, err)
+		return attrs, false
+	}
+	if link == nil || link.ChatwootMessageID == 0 {
+		return attrs, false
+	}
+	attrs["in_reply_to"] = link.ChatwootMessageID
+	return attrs, true
 }
 
 func chatwootMessageTypeFromPayload(data map[string]any) string {
@@ -592,7 +679,6 @@ func extractStructuredMessageContent(data map[string]any) string {
 		}
 		return sb.String()
 	}
-
 
 	if contact, ok := data["contact"]; ok && contact != nil {
 		if name, phone, ok := extractContactDetails(contact); ok {
@@ -1048,8 +1134,9 @@ func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventNam
 	)
 	switch eventName {
 	case "message.reaction":
-		content = buildReactionChatwootContent(data, info.FromName)
-		if rid, _ := data["reacted_message_id"].(string); rid != "" {
+		rid, _ := data["reacted_message_id"].(string)
+		content = buildReactionChatwootContent(data, info.FromName, reactedMessagePreview(deviceID, linkRepo, rid))
+		if rid != "" {
 			msgOpts.ContentAttributes = map[string]any{"in_reply_to_external_id": "WAID:" + rid}
 		}
 	case "message.edited", "message.revoked", "message.deleted":
@@ -1072,7 +1159,21 @@ func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventNam
 			msgOpts.SourceID = "WAID:" + id
 		}
 		if rid, _ := data["replied_to_id"].(string); rid != "" {
-			msgOpts.ContentAttributes = map[string]any{"in_reply_to_external_id": "WAID:" + rid}
+			attrs, linked := buildChatwootReplyAttributes(deviceID, linkRepo, rid)
+			msgOpts.ContentAttributes = attrs
+			// Without a resolved link the quote will not render in Chatwoot
+			// (in_reply_to_external_id only matches WAID-stamped messages), so
+			// fall back to quoting the replied-to text inline.
+			if !linked {
+				if quoted, _ := data["quoted_body"].(string); strings.TrimSpace(quoted) != "" {
+					quote := "> " + oneLineExcerpt(quoted, reactedMessagePreviewMaxRunes)
+					if content == "" {
+						content = quote
+					} else {
+						content = quote + "\n\n" + content
+					}
+				}
+			}
 		}
 	}
 	info.IsFromMe = chatwootMessageTypeFromPayload(data) == "outgoing"

@@ -1,9 +1,11 @@
 package whatsapp
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 )
 
@@ -356,8 +358,29 @@ func TestBuildReactionChatwootContent(t *testing.T) {
 		name     string
 		payload  map[string]any
 		fromName string
+		preview  string
 		expected string
 	}{
+		{
+			name: "reaction quotes resolved message preview",
+			payload: map[string]any{
+				"reaction":           "👍",
+				"reacted_message_id": "wamid-123",
+			},
+			fromName: "Alice",
+			preview:  "bom dia, tudo certo?",
+			expected: "Alice reacted 👍 to “bom dia, tudo certo?”",
+		},
+		{
+			name: "reaction removal quotes resolved message preview",
+			payload: map[string]any{
+				"reaction":           "",
+				"reacted_message_id": "wamid-123",
+			},
+			fromName: "Alice",
+			preview:  "bom dia, tudo certo?",
+			expected: "Alice removed a reaction from “bom dia, tudo certo?”",
+		},
 		{
 			name: "reaction with sender name and target id",
 			payload: map[string]any{
@@ -408,8 +431,187 @@ func TestBuildReactionChatwootContent(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := buildReactionChatwootContent(tc.payload, tc.fromName); got != tc.expected {
+			if got := buildReactionChatwootContent(tc.payload, tc.fromName, tc.preview); got != tc.expected {
 				t.Fatalf("expected %q, got %q", tc.expected, got)
+			}
+		})
+	}
+}
+
+type reactedPreviewTestRepo struct {
+	chatstorage.IChatStorageRepository
+	byDevice map[string]*chatstorage.Message
+	byID     map[string]*chatstorage.Message
+}
+
+func (r *reactedPreviewTestRepo) GetMessageByIDAndDevice(deviceID, id string) (*chatstorage.Message, error) {
+	return r.byDevice[deviceID+"|"+id], nil
+}
+
+func (r *reactedPreviewTestRepo) GetMessageByID(id string) (*chatstorage.Message, error) {
+	return r.byID[id], nil
+}
+
+func TestReactedMessagePreview(t *testing.T) {
+	repo := &reactedPreviewTestRepo{
+		byDevice: map[string]*chatstorage.Message{
+			"device-1|wamid-text":  {Content: "  olá,\ncomo vai?  "},
+			"device-1|wamid-image": {MediaType: "image"},
+			"device-1|wamid-doc":   {MediaType: "document", Filename: "contrato.pdf"},
+			"device-1|wamid-long":  {Content: strings.Repeat("a", 100)},
+		},
+		byID: map[string]*chatstorage.Message{
+			"wamid-global": {Content: "mensagem global"},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		deviceID  string
+		messageID string
+		expected  string
+	}{
+		{
+			name:      "text message collapses whitespace",
+			deviceID:  "device-1",
+			messageID: "wamid-text",
+			expected:  "olá, como vai?",
+		},
+		{
+			name:      "media without caption falls back to media type",
+			deviceID:  "device-1",
+			messageID: "wamid-image",
+			expected:  "(image)",
+		},
+		{
+			name:      "document includes filename",
+			deviceID:  "device-1",
+			messageID: "wamid-doc",
+			expected:  "(document: contrato.pdf)",
+		},
+		{
+			name:      "long content is truncated with ellipsis",
+			deviceID:  "device-1",
+			messageID: "wamid-long",
+			expected:  strings.Repeat("a", 80) + "…",
+		},
+		{
+			name:      "empty device id falls back to global lookup",
+			deviceID:  "",
+			messageID: "wamid-global",
+			expected:  "mensagem global",
+		},
+		{
+			name:      "unknown message yields empty preview",
+			deviceID:  "device-1",
+			messageID: "wamid-missing",
+			expected:  "",
+		},
+		{
+			name:      "empty message id yields empty preview",
+			deviceID:  "device-1",
+			messageID: "",
+			expected:  "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reactedMessagePreview(tc.deviceID, repo, tc.messageID); got != tc.expected {
+				t.Fatalf("expected %q, got %q", tc.expected, got)
+			}
+		})
+	}
+
+	t.Run("nil repo yields empty preview", func(t *testing.T) {
+		if got := reactedMessagePreview("device-1", nil, "wamid-text"); got != "" {
+			t.Fatalf("expected empty preview, got %q", got)
+		}
+	})
+}
+
+type replyAttrsTestRepo struct {
+	chatstorage.IChatStorageRepository
+	links map[string]*chatstorage.ChatwootMessageLink
+}
+
+func (r *replyAttrsTestRepo) GetChatwootMessageLinkByWhatsAppID(deviceID, waMessageID string) (*chatstorage.ChatwootMessageLink, error) {
+	return r.links[deviceID+"|"+waMessageID], nil
+}
+
+func TestBuildChatwootReplyAttributes(t *testing.T) {
+	repo := &replyAttrsTestRepo{
+		links: map[string]*chatstorage.ChatwootMessageLink{
+			"device-1|wamid-linked":    {ChatwootMessageID: 77},
+			"device-1|wamid-zero-link": {ChatwootMessageID: 0},
+		},
+	}
+
+	t.Run("linked reply sets native in_reply_to", func(t *testing.T) {
+		attrs, linked := buildChatwootReplyAttributes("device-1", repo, "wamid-linked")
+		if !linked {
+			t.Fatal("expected linked=true")
+		}
+		if attrs["in_reply_to"] != 77 {
+			t.Fatalf("expected in_reply_to=77, got %v", attrs["in_reply_to"])
+		}
+		if attrs["in_reply_to_external_id"] != "WAID:wamid-linked" {
+			t.Fatalf("unexpected external id %v", attrs["in_reply_to_external_id"])
+		}
+	})
+
+	t.Run("unlinked reply keeps only external id", func(t *testing.T) {
+		attrs, linked := buildChatwootReplyAttributes("device-1", repo, "wamid-unknown")
+		if linked {
+			t.Fatal("expected linked=false")
+		}
+		if _, ok := attrs["in_reply_to"]; ok {
+			t.Fatal("in_reply_to should not be set without a link")
+		}
+		if attrs["in_reply_to_external_id"] != "WAID:wamid-unknown" {
+			t.Fatalf("unexpected external id %v", attrs["in_reply_to_external_id"])
+		}
+	})
+
+	t.Run("link with zero chatwoot id is not linked", func(t *testing.T) {
+		if _, linked := buildChatwootReplyAttributes("device-1", repo, "wamid-zero-link"); linked {
+			t.Fatal("expected linked=false for zero chatwoot message id")
+		}
+	})
+
+	t.Run("nil repo keeps only external id", func(t *testing.T) {
+		attrs, linked := buildChatwootReplyAttributes("device-1", nil, "wamid-linked")
+		if linked {
+			t.Fatal("expected linked=false with nil repo")
+		}
+		if attrs["in_reply_to_external_id"] != "WAID:wamid-linked" {
+			t.Fatalf("unexpected external id %v", attrs["in_reply_to_external_id"])
+		}
+	})
+
+	t.Run("empty device id keeps only external id", func(t *testing.T) {
+		if _, linked := buildChatwootReplyAttributes("", repo, "wamid-linked"); linked {
+			t.Fatal("expected linked=false with empty device id")
+		}
+	})
+}
+
+func TestOneLineExcerpt(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		max  int
+		want string
+	}{
+		{name: "collapses newlines and spaces", in: "  olá,\n  como   vai? ", max: 80, want: "olá, como vai?"},
+		{name: "truncates with ellipsis", in: strings.Repeat("b", 90), max: 80, want: strings.Repeat("b", 80) + "…"},
+		{name: "short string unchanged", in: "oi", max: 80, want: "oi"},
+		{name: "empty string", in: "", max: 80, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := oneLineExcerpt(tt.in, tt.max); got != tt.want {
+				t.Fatalf("oneLineExcerpt(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}

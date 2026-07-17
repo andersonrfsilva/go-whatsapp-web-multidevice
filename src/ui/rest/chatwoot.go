@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,6 +70,53 @@ func composeOutgoingText(payload chatwoot.WebhookPayload) string {
 // message_created webhook before that cache entry exists.
 func isEchoOfForwardedMessage(payload chatwoot.WebhookPayload) bool {
 	return strings.HasPrefix(payload.SourceID, "WAID:")
+}
+
+// chatwootInReplyToID extracts the Chatwoot message id an agent reply quotes
+// (content_attributes.in_reply_to), or 0 when the message quotes nothing.
+// JSON decoding yields float64 for numbers; int and string are accepted for
+// robustness across Chatwoot versions.
+func chatwootInReplyToID(attrs map[string]any) int {
+	raw, ok := attrs["in_reply_to"]
+	if !ok || raw == nil {
+		return 0
+	}
+	switch v := raw.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case string:
+		id, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0
+		}
+		return id
+	default:
+		return 0
+	}
+}
+
+// resolveReplyMessageID maps the Chatwoot message an agent reply quotes to the
+// WhatsApp message id it mirrors, so the reply goes out as a real WhatsApp
+// quote instead of a plain text. Returns nil when the reply quotes nothing or
+// no link is stored (the reply is then sent without quote context).
+func (h *ChatwootHandler) resolveReplyMessageID(deviceID string, payload chatwoot.WebhookPayload) *string {
+	chatwootID := chatwootInReplyToID(payload.ContentAttributes)
+	if chatwootID == 0 || h.ChatStorageRepo == nil || deviceID == "" {
+		return nil
+	}
+	link, err := h.ChatStorageRepo.GetChatwootMessageLinkByChatwootID(deviceID, chatwootID)
+	if err != nil {
+		logrus.Warnf("Chatwoot Webhook: Failed to resolve quoted Chatwoot message %d: %v", chatwootID, err)
+		return nil
+	}
+	if link == nil || link.WhatsAppMessageID == "" {
+		logrus.Debugf("Chatwoot Webhook: No WhatsApp link for quoted Chatwoot message %d, sending without quote", chatwootID)
+		return nil
+	}
+	waMessageID := link.WhatsAppMessageID
+	return &waMessageID
 }
 
 func chatwootPayloadDeleted(payload chatwoot.WebhookPayload) bool {
@@ -314,18 +362,24 @@ func (h *ChatwootHandler) HandleWebhook(c *fiber.Ctx) error {
 	// the same composed body.
 	outgoingText := composeOutgoingText(payload)
 
+	// When the agent used Chatwoot's reply feature, resolve the quoted message
+	// to its WhatsApp id so the outgoing message quotes it in WhatsApp too.
+	replyMessageID := h.resolveReplyMessageID(storageDeviceID, payload)
+
 	// Handle attachments if present
 	if len(payload.Attachments) > 0 {
 		sentAny := false
 		for i, attachment := range payload.Attachments {
-			// The caption belongs to the message as a whole, so it rides on the
-			// first attachment only — otherwise a multi-file reply repeats the
-			// same caption under every file.
+			// The caption (and quote context) belongs to the message as a whole,
+			// so both ride on the first attachment only — otherwise a multi-file
+			// reply repeats the same caption under every file.
 			caption := ""
+			var attachmentReplyID *string
 			if i == 0 {
 				caption = outgoingText
+				attachmentReplyID = replyMessageID
 			}
-			resp, err := h.handleAttachment(ctx, sendDestination, attachment, caption)
+			resp, err := h.handleAttachment(ctx, sendDestination, attachment, caption, attachmentReplyID)
 			if err != nil {
 				logrus.Errorf("Chatwoot Webhook: Failed to send attachment %d: %v", attachment.ID, err)
 				h.notifySendFailure(payload, fmt.Errorf("attachment %d failed: %w", attachment.ID, err))
@@ -344,7 +398,8 @@ func (h *ChatwootHandler) HandleWebhook(c *fiber.Ctx) error {
 	// If content is present (and not just an attachment caption), send it as text
 	if outgoingText != "" {
 		req := domainSend.MessageRequest{
-			Message: outgoingText,
+			Message:        outgoingText,
+			ReplyMessageID: replyMessageID,
 		}
 		req.Phone = sendDestination
 
@@ -482,13 +537,14 @@ func (h *ChatwootHandler) notifySendFailure(payload chatwoot.WebhookPayload, sen
 	}
 }
 
-func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, att chatwoot.Attachment, caption string) (domainSend.GenericResponse, error) {
+func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, att chatwoot.Attachment, caption string, replyMessageID *string) (domainSend.GenericResponse, error) {
 	switch att.FileType {
 	case "image":
 		req := domainSend.ImageRequest{
-			BaseRequest: domainSend.BaseRequest{Phone: phone},
-			Caption:     caption,
-			ImageURL:    &att.DataURL,
+			BaseRequest:    domainSend.BaseRequest{Phone: phone},
+			Caption:        caption,
+			ImageURL:       &att.DataURL,
+			ReplyMessageID: replyMessageID,
 		}
 		resp, err := h.SendUsecase.SendImage(ctx, req)
 		if err == nil {
@@ -498,9 +554,10 @@ func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, at
 
 	case "audio":
 		req := domainSend.AudioRequest{
-			BaseRequest: domainSend.BaseRequest{Phone: phone},
-			AudioURL:    &att.DataURL,
-			PTT:         true, // Send as PTT (Voice Note) for better mobile experience
+			BaseRequest:    domainSend.BaseRequest{Phone: phone},
+			AudioURL:       &att.DataURL,
+			PTT:            true, // Send as PTT (Voice Note) for better mobile experience
+			ReplyMessageID: replyMessageID,
 		}
 		resp, err := h.SendUsecase.SendAudio(ctx, req)
 		if err == nil {
@@ -511,9 +568,10 @@ func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, at
 		logrus.Warnf("Chatwoot Webhook: Failed to send as audio (%v), retrying as file...", err)
 		// Fallback to sending as file
 		reqFile := domainSend.FileRequest{
-			BaseRequest: domainSend.BaseRequest{Phone: phone},
-			FileURL:     &att.DataURL,
-			Caption:     caption,
+			BaseRequest:    domainSend.BaseRequest{Phone: phone},
+			FileURL:        &att.DataURL,
+			Caption:        caption,
+			ReplyMessageID: replyMessageID,
 		}
 		resp, err = h.SendUsecase.SendFile(ctx, reqFile)
 		if err == nil {
@@ -523,9 +581,10 @@ func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, at
 
 	case "video":
 		req := domainSend.VideoRequest{
-			BaseRequest: domainSend.BaseRequest{Phone: phone},
-			Caption:     caption,
-			VideoURL:    &att.DataURL,
+			BaseRequest:    domainSend.BaseRequest{Phone: phone},
+			Caption:        caption,
+			VideoURL:       &att.DataURL,
+			ReplyMessageID: replyMessageID,
 		}
 		resp, err := h.SendUsecase.SendVideo(ctx, req)
 		if err == nil {
@@ -536,9 +595,10 @@ func (h *ChatwootHandler) handleAttachment(ctx context.Context, phone string, at
 	default:
 		// Default to file for other types
 		req := domainSend.FileRequest{
-			BaseRequest: domainSend.BaseRequest{Phone: phone},
-			FileURL:     &att.DataURL,
-			Caption:     caption,
+			BaseRequest:    domainSend.BaseRequest{Phone: phone},
+			FileURL:        &att.DataURL,
+			Caption:        caption,
+			ReplyMessageID: replyMessageID,
 		}
 		resp, err := h.SendUsecase.SendFile(ctx, req)
 		if err == nil {

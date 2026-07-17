@@ -373,3 +373,98 @@ func TestChatwootLinkChatJID(t *testing.T) {
 		})
 	}
 }
+
+func TestChatwootInReplyToID(t *testing.T) {
+	tests := []struct {
+		name  string
+		attrs map[string]any
+		want  int
+	}{
+		{name: "json number decodes as float64", attrs: map[string]any{"in_reply_to": float64(123)}, want: 123},
+		{name: "int is accepted", attrs: map[string]any{"in_reply_to": 456}, want: 456},
+		{name: "numeric string is accepted", attrs: map[string]any{"in_reply_to": " 789 "}, want: 789},
+		{name: "non-numeric string yields zero", attrs: map[string]any{"in_reply_to": "abc"}, want: 0},
+		{name: "missing key yields zero", attrs: map[string]any{}, want: 0},
+		{name: "nil attrs yields zero", attrs: nil, want: 0},
+		{name: "nil value yields zero", attrs: map[string]any{"in_reply_to": nil}, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := chatwootInReplyToID(tt.attrs); got != tt.want {
+				t.Fatalf("chatwootInReplyToID(%v) = %d, want %d", tt.attrs, got, tt.want)
+			}
+		})
+	}
+}
+
+type chatwootReplyLinkTestRepo struct {
+	domainChatStorage.IChatStorageRepository
+	links map[int]*domainChatStorage.ChatwootMessageLink
+	err   error
+}
+
+func (r *chatwootReplyLinkTestRepo) GetChatwootMessageLinkByChatwootID(deviceID string, chatwootMessageID int) (*domainChatStorage.ChatwootMessageLink, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.links[chatwootMessageID], nil
+}
+
+func TestResolveReplyMessageID(t *testing.T) {
+	repo := &chatwootReplyLinkTestRepo{
+		links: map[int]*domainChatStorage.ChatwootMessageLink{
+			42: {WhatsAppMessageID: "3EB0AAAA"},
+			43: {WhatsAppMessageID: ""},
+		},
+	}
+	handler := &ChatwootHandler{ChatStorageRepo: repo}
+
+	payloadWithReply := func(v any) chatwoot.WebhookPayload {
+		return chatwoot.WebhookPayload{ContentAttributes: map[string]any{"in_reply_to": v}}
+	}
+
+	t.Run("linked quote resolves to whatsapp message id", func(t *testing.T) {
+		got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42)))
+		if got == nil || *got != "3EB0AAAA" {
+			t.Fatalf("expected 3EB0AAAA, got %v", got)
+		}
+	})
+
+	t.Run("unknown quote yields nil", func(t *testing.T) {
+		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(99))); got != nil {
+			t.Fatalf("expected nil, got %q", *got)
+		}
+	})
+
+	t.Run("link without whatsapp id yields nil", func(t *testing.T) {
+		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(43))); got != nil {
+			t.Fatalf("expected nil, got %q", *got)
+		}
+	})
+
+	t.Run("no quote yields nil", func(t *testing.T) {
+		if got := handler.resolveReplyMessageID("device-1", chatwoot.WebhookPayload{}); got != nil {
+			t.Fatalf("expected nil, got %q", *got)
+		}
+	})
+
+	t.Run("empty device id yields nil", func(t *testing.T) {
+		if got := handler.resolveReplyMessageID("", payloadWithReply(float64(42))); got != nil {
+			t.Fatalf("expected nil, got %q", *got)
+		}
+	})
+
+	t.Run("repo error yields nil", func(t *testing.T) {
+		errHandler := &ChatwootHandler{ChatStorageRepo: &chatwootReplyLinkTestRepo{err: errors.New("boom")}}
+		if got := errHandler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
+			t.Fatalf("expected nil, got %q", *got)
+		}
+	})
+
+	t.Run("nil repo yields nil", func(t *testing.T) {
+		nilHandler := &ChatwootHandler{}
+		if got := nilHandler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
+			t.Fatalf("expected nil, got %q", *got)
+		}
+	})
+}
