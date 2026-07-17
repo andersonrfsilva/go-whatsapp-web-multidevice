@@ -652,6 +652,41 @@ func (c *Client) CreateInbox(name, webhookURL string) (*Inbox, error) {
 	return nil, fmt.Errorf("failed to decode inbox response (no valid ID found): %s", string(bodyBytes))
 }
 
+// GetMessageSourceID lista as mensagens da conversa e devolve o source_id da
+// mensagem com o id dado, ou "" se não achar.
+func (c *Client) GetMessageSourceID(conversationID, messageID int) (string, error) {
+	if conversationID == 0 || messageID == 0 {
+		return "", nil
+	}
+	endpoint := fmt.Sprintf("%s/api/v1/accounts/%d/conversations/%d/messages", c.BaseURL, c.AccountID, conversationID)
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("api_access_token", c.APIToken)
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", &HTTPStatusError{StatusCode: resp.StatusCode, Op: "list messages", Body: string(body)}
+	}
+	var result struct {
+		Payload []Message `json:"payload"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	for _, m := range result.Payload {
+		if m.ID == messageID {
+			return m.SourceID, nil
+		}
+	}
+	return "", nil
+}
+
 // MessageOptions carries optional fields for CreateMessage. SourceID stamps
 // the Chatwoot message with the WhatsApp "WAID:<id>" identifier - the same
 // convention the direct-DB importer uses - which both strengthens echo dedup

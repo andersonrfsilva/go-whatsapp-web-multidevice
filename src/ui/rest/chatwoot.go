@@ -97,26 +97,46 @@ func chatwootInReplyToID(attrs map[string]any) int {
 	}
 }
 
+// resolveQuotedSourceIDFn is a seam over chatwoot.Client.GetMessageSourceID
+// for testing; production wiring resolves the default client lazily so tests
+// can override it without needing a configured Chatwoot client.
+var resolveQuotedSourceIDFn = func(conversationID, messageID int) (string, error) {
+	cw := chatwoot.GetDefaultClient()
+	if cw == nil || !cw.IsConfigured() {
+		return "", nil
+	}
+	return cw.GetMessageSourceID(conversationID, messageID)
+}
+
 // resolveReplyMessageID maps the Chatwoot message an agent reply quotes to the
 // WhatsApp message id it mirrors, so the reply goes out as a real WhatsApp
 // quote instead of a plain text. Returns nil when the reply quotes nothing or
-// no link is stored (the reply is then sent without quote context).
+// no WhatsApp id can be found (the reply is then sent without quote context).
 func (h *ChatwootHandler) resolveReplyMessageID(deviceID string, payload chatwoot.WebhookPayload) *string {
 	chatwootID := chatwootInReplyToID(payload.ContentAttributes)
-	if chatwootID == 0 || h.ChatStorageRepo == nil || deviceID == "" {
+	if chatwootID == 0 {
 		return nil
 	}
-	link, err := h.ChatStorageRepo.GetChatwootMessageLinkByChatwootID(deviceID, chatwootID)
+	// 1) Link local (rápido; cobre mensagens com link já armazenado, ex.: outgoing).
+	if h.ChatStorageRepo != nil && deviceID != "" {
+		link, err := h.ChatStorageRepo.GetChatwootMessageLinkByChatwootID(deviceID, chatwootID)
+		if err != nil {
+			logrus.Warnf("Chatwoot Webhook: Failed to resolve quoted Chatwoot message %d: %v", chatwootID, err)
+		} else if link != nil && link.WhatsAppMessageID != "" {
+			waID := link.WhatsAppMessageID
+			return &waID
+		}
+	}
+	// 2) Fallback: source_id ("WAID:<id>") da mensagem citada via API do Chatwoot —
+	// cobre mensagens do cliente (incoming) que não têm link local.
+	sourceID, err := resolveQuotedSourceIDFn(payload.Conversation.ID, chatwootID)
 	if err != nil {
-		logrus.Warnf("Chatwoot Webhook: Failed to resolve quoted Chatwoot message %d: %v", chatwootID, err)
-		return nil
+		logrus.Warnf("Chatwoot Webhook: Failed to fetch source_id for quoted message %d: %v", chatwootID, err)
+	} else if waID := strings.TrimPrefix(sourceID, "WAID:"); sourceID != "" && waID != sourceID && waID != "" {
+		return &waID
 	}
-	if link == nil || link.WhatsAppMessageID == "" {
-		logrus.Debugf("Chatwoot Webhook: No WhatsApp link for quoted Chatwoot message %d, sending without quote", chatwootID)
-		return nil
-	}
-	waMessageID := link.WhatsAppMessageID
-	return &waMessageID
+	logrus.Debugf("Chatwoot Webhook: No WhatsApp id for quoted Chatwoot message %d, sending without quote", chatwootID)
+	return nil
 }
 
 func chatwootPayloadDeleted(payload chatwoot.WebhookPayload) bool {

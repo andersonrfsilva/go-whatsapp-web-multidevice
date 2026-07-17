@@ -468,3 +468,113 @@ func TestResolveReplyMessageID(t *testing.T) {
 		}
 	})
 }
+
+// withResolveQuotedSourceIDFn overrides the resolveQuotedSourceIDFn seam for
+// the duration of a subtest and restores the original on cleanup.
+func withResolveQuotedSourceIDFn(t *testing.T, fn func(conversationID, messageID int) (string, error)) {
+	t.Helper()
+	prev := resolveQuotedSourceIDFn
+	resolveQuotedSourceIDFn = fn
+	t.Cleanup(func() {
+		resolveQuotedSourceIDFn = prev
+	})
+}
+
+func TestResolveReplyMessageIDFallsBackToSourceID(t *testing.T) {
+	payloadWithReply := func(v any) chatwoot.WebhookPayload {
+		return chatwoot.WebhookPayload{
+			ContentAttributes: map[string]any{"in_reply_to": v},
+			Conversation:      chatwoot.ConversationWebhook{ID: 202},
+		}
+	}
+
+	t.Run("no local link falls back to source_id WAID prefix", func(t *testing.T) {
+		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
+			if conversationID != 202 || messageID != 42 {
+				t.Fatalf("unexpected args conversationID=%d messageID=%d", conversationID, messageID)
+			}
+			return "WAID:ABC123", nil
+		})
+
+		// No ChatStorageRepo => the local-link path is skipped entirely, so
+		// resolution must come from the fallback.
+		handler := &ChatwootHandler{}
+		got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42)))
+		if got == nil || *got != "ABC123" {
+			t.Fatalf("expected ABC123, got %v", got)
+		}
+	})
+
+	t.Run("local link miss falls back to source_id", func(t *testing.T) {
+		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
+			return "WAID:XYZ999", nil
+		})
+
+		repo := &chatwootReplyLinkTestRepo{links: map[int]*domainChatStorage.ChatwootMessageLink{}}
+		handler := &ChatwootHandler{ChatStorageRepo: repo}
+		got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42)))
+		if got == nil || *got != "XYZ999" {
+			t.Fatalf("expected XYZ999, got %v", got)
+		}
+	})
+
+	t.Run("local link hit takes priority over fallback", func(t *testing.T) {
+		fallbackCalled := false
+		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
+			fallbackCalled = true
+			return "WAID:SHOULD_NOT_BE_USED", nil
+		})
+
+		repo := &chatwootReplyLinkTestRepo{links: map[int]*domainChatStorage.ChatwootMessageLink{
+			42: {WhatsAppMessageID: "3EB0AAAA"},
+		}}
+		handler := &ChatwootHandler{ChatStorageRepo: repo}
+		got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42)))
+		if got == nil || *got != "3EB0AAAA" {
+			t.Fatalf("expected 3EB0AAAA, got %v", got)
+		}
+		if fallbackCalled {
+			t.Fatalf("fallback should not be called when a local link is found")
+		}
+	})
+
+	t.Run("source_id without WAID prefix yields nil", func(t *testing.T) {
+		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
+			return "12345", nil
+		})
+		handler := &ChatwootHandler{}
+		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
+			t.Fatalf("expected nil, got %q", *got)
+		}
+	})
+
+	t.Run("empty source_id yields nil", func(t *testing.T) {
+		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
+			return "", nil
+		})
+		handler := &ChatwootHandler{}
+		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
+			t.Fatalf("expected nil, got %q", *got)
+		}
+	})
+
+	t.Run("bare WAID prefix with empty id yields nil", func(t *testing.T) {
+		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
+			return "WAID:", nil
+		})
+		handler := &ChatwootHandler{}
+		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
+			t.Fatalf("expected nil, got %q", *got)
+		}
+	})
+
+	t.Run("fallback error yields nil", func(t *testing.T) {
+		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
+			return "", errors.New("boom")
+		})
+		handler := &ChatwootHandler{}
+		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
+			t.Fatalf("expected nil, got %q", *got)
+		}
+	})
+}
