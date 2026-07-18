@@ -3,6 +3,7 @@ package chatwoot
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -1373,20 +1374,16 @@ func TestEchoDedup_MapBehavior(t *testing.T) {
 // --- GetMessageSourceID ----------------------------------------------------
 
 func TestGetMessageSourceID(t *testing.T) {
-	// The Chatwoot REST messages endpoint types message_type as a NUMBER
-	// (0=incoming, 1=outgoing, 2=activity) and content_type as a number too —
-	// unlike the webhook payload where message_type is a string. This body
-	// mirrors a real response and is the exact shape that broke the first
-	// version of GetMessageSourceID (it decoded into []Message, whose
-	// MessageType is a string, and failed with "cannot unmarshal number").
-	const body = `{"payload":[
-		{"id":485783,"content":"oi","message_type":0,"content_type":0,"source_id":"WAID:INBOUND123"},
-		{"id":485784,"content":"resposta","message_type":1,"content_type":0,"source_id":"WAID:OUTBOUND456"},
-		{"id":485785,"content":"nota","message_type":2,"content_type":0}
-	]}`
-
-	t.Run("resolves source_id for a numeric message_type payload", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// pagedMessagesHandler mimics Chatwoot's GET conversations/{id}/messages:
+	// message_type is a NUMBER (0=incoming, 1=outgoing, 2=activity) — the shape
+	// that broke the first version (it decoded into []Message whose MessageType
+	// is a string). It also paginates: ~20 messages per page, newest first,
+	// backward via ?before=<id>. Messages 100..140 exist; only the inbound one
+	// at id 105 carries a source_id, and it sits on the SECOND page — so a
+	// single-page lookup (the earlier bug) would miss it.
+	const pageSize = 20
+	pagedMessagesHandler := func(t *testing.T) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				t.Errorf("method = %s, want GET", r.Method)
 			}
@@ -1396,28 +1393,59 @@ func TestGetMessageSourceID(t *testing.T) {
 			if want := "/api/v1/accounts/1/conversations/202/messages"; r.URL.Path != want {
 				t.Errorf("path = %q, want %q", r.URL.Path, want)
 			}
-			_, _ = io.WriteString(w, body)
-		}))
-		defer srv.Close()
+			before := 1 << 30
+			if b := r.URL.Query().Get("before"); b != "" {
+				if _, err := fmt.Sscanf(b, "%d", &before); err != nil {
+					t.Errorf("bad before=%q", b)
+				}
+			}
+			// Collect ids < before, keep the highest pageSize, ascending order.
+			var ids []int
+			for i := 140; i >= 100; i-- {
+				if i < before {
+					ids = append(ids, i)
+					if len(ids) == pageSize {
+						break
+					}
+				}
+			}
+			// ids currently descending; emit ascending like real Chatwoot.
+			var b strings.Builder
+			b.WriteString(`{"payload":[`)
+			for k := len(ids) - 1; k >= 0; k-- {
+				id := ids[k]
+				if k != len(ids)-1 {
+					b.WriteByte(',')
+				}
+				if id == 105 {
+					fmt.Fprintf(&b, `{"id":%d,"message_type":0,"content_type":0,"source_id":"WAID:FOUND105"}`, id)
+				} else {
+					fmt.Fprintf(&b, `{"id":%d,"message_type":1,"content_type":0,"source_id":null}`, id)
+				}
+			}
+			b.WriteString(`]}`)
+			_, _ = io.WriteString(w, b.String())
+		}
+	}
 
+	t.Run("resolves inbound source_id found on a later page", func(t *testing.T) {
+		srv := httptest.NewServer(pagedMessagesHandler(t))
+		defer srv.Close()
 		c := newTestClient(t, srv.URL)
-		// The inbound (customer) message — the case that was silently failing.
-		got, err := c.GetMessageSourceID(202, 485783)
+		got, err := c.GetMessageSourceID(202, 105)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got != "WAID:INBOUND123" {
-			t.Fatalf("source_id = %q, want WAID:INBOUND123", got)
+		if got != "WAID:FOUND105" {
+			t.Fatalf("source_id = %q, want WAID:FOUND105", got)
 		}
 	})
 
 	t.Run("returns empty (no error) when the id is absent", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = io.WriteString(w, body)
-		}))
+		srv := httptest.NewServer(pagedMessagesHandler(t))
 		defer srv.Close()
 		c := newTestClient(t, srv.URL)
-		got, err := c.GetMessageSourceID(202, 999999)
+		got, err := c.GetMessageSourceID(202, 999) // never present; paging stops at floor
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

@@ -652,45 +652,80 @@ func (c *Client) CreateInbox(name, webhookURL string) (*Inbox, error) {
 	return nil, fmt.Errorf("failed to decode inbox response (no valid ID found): %s", string(bodyBytes))
 }
 
-// GetMessageSourceID lista as mensagens da conversa e devolve o source_id da
-// mensagem com o id dado, ou "" se não achar.
+// maxMessageSourceIDPages bounds how far back GetMessageSourceID pages when
+// looking for a quoted message. The Chatwoot messages endpoint returns ~20
+// messages per page (newest first) and only supports backward paging via
+// ?before=<id>. An agent commonly quotes a customer message that is many
+// messages old, so a single page is not enough; 40 pages (~800 messages) is a
+// generous ceiling that still bounds the worst case (a reply to a very old
+// message just goes out without a quote instead of paging forever).
+const maxMessageSourceIDPages = 40
+
+// GetMessageSourceID returns the source_id ("WAID:<whatsapp-id>") that the
+// forwarder stamped on the mirrored Chatwoot message with the given id, or ""
+// if it cannot be found. The Chatwoot REST messages endpoint has no
+// get-one-by-id, so this lists the conversation's messages newest-first and
+// pages backward with ?before=<smallest-id-seen> until it finds the target,
+// runs past it (ids are monotonic within a conversation), empties out, or hits
+// the page ceiling.
 func (c *Client) GetMessageSourceID(conversationID, messageID int) (string, error) {
 	if conversationID == 0 || messageID == 0 {
 		return "", nil
 	}
-	endpoint := fmt.Sprintf("%s/api/v1/accounts/%d/conversations/%d/messages", c.BaseURL, c.AccountID, conversationID)
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("api_access_token", c.APIToken)
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", &HTTPStatusError{StatusCode: resp.StatusCode, Op: "list messages", Body: string(body)}
-	}
-	// Decode into a minimal local shape rather than []Message: the REST
-	// messages endpoint types some fields differently from the webhook payload
-	// (notably message_type is a number here, "incoming"/"outgoing" string in
-	// the webhook), so decoding into Message would fail with a type error. We
-	// only need id and source_id, so read just those.
-	var result struct {
-		Payload []struct {
-			ID       int    `json:"id"`
-			SourceID string `json:"source_id"`
-		} `json:"payload"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-	for _, m := range result.Payload {
-		if m.ID == messageID {
-			return m.SourceID, nil
+	before := 0
+	for page := 0; page < maxMessageSourceIDPages; page++ {
+		endpoint := fmt.Sprintf("%s/api/v1/accounts/%d/conversations/%d/messages", c.BaseURL, c.AccountID, conversationID)
+		if before > 0 {
+			endpoint += fmt.Sprintf("?before=%d", before)
 		}
+		req, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("api_access_token", c.APIToken)
+		resp, err := c.HTTPClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return "", &HTTPStatusError{StatusCode: resp.StatusCode, Op: "list messages", Body: string(body)}
+		}
+		// Decode into a minimal local shape rather than []Message: the REST
+		// messages endpoint types some fields differently from the webhook
+		// payload (notably message_type is a number here, "incoming"/"outgoing"
+		// string in the webhook), so decoding into Message would fail with a
+		// type error. We only need id and source_id, so read just those.
+		var result struct {
+			Payload []struct {
+				ID       int    `json:"id"`
+				SourceID string `json:"source_id"`
+			} `json:"payload"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		if err != nil {
+			return "", err
+		}
+		if len(result.Payload) == 0 {
+			return "", nil
+		}
+		minID := 0
+		for _, m := range result.Payload {
+			if m.ID == messageID {
+				return m.SourceID, nil
+			}
+			if minID == 0 || m.ID < minID {
+				minID = m.ID
+			}
+		}
+		// The smallest id on this page is already <= the target, so the target
+		// (not seen above) is not in this conversation — stop paging backward.
+		if minID <= messageID {
+			return "", nil
+		}
+		before = minID
 	}
 	return "", nil
 }
