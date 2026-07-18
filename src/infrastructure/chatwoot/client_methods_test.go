@@ -1369,3 +1369,70 @@ func TestEchoDedup_MapBehavior(t *testing.T) {
 		t.Error("IsMessageSentByUs(unknown) = true, want false")
 	}
 }
+
+// --- GetMessageSourceID ----------------------------------------------------
+
+func TestGetMessageSourceID(t *testing.T) {
+	// The Chatwoot REST messages endpoint types message_type as a NUMBER
+	// (0=incoming, 1=outgoing, 2=activity) and content_type as a number too —
+	// unlike the webhook payload where message_type is a string. This body
+	// mirrors a real response and is the exact shape that broke the first
+	// version of GetMessageSourceID (it decoded into []Message, whose
+	// MessageType is a string, and failed with "cannot unmarshal number").
+	const body = `{"payload":[
+		{"id":485783,"content":"oi","message_type":0,"content_type":0,"source_id":"WAID:INBOUND123"},
+		{"id":485784,"content":"resposta","message_type":1,"content_type":0,"source_id":"WAID:OUTBOUND456"},
+		{"id":485785,"content":"nota","message_type":2,"content_type":0}
+	]}`
+
+	t.Run("resolves source_id for a numeric message_type payload", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Errorf("method = %s, want GET", r.Method)
+			}
+			if got := r.Header.Get("api_access_token"); got != "token" {
+				t.Errorf("api_access_token = %q, want token", got)
+			}
+			if want := "/api/v1/accounts/1/conversations/202/messages"; r.URL.Path != want {
+				t.Errorf("path = %q, want %q", r.URL.Path, want)
+			}
+			_, _ = io.WriteString(w, body)
+		}))
+		defer srv.Close()
+
+		c := newTestClient(t, srv.URL)
+		// The inbound (customer) message — the case that was silently failing.
+		got, err := c.GetMessageSourceID(202, 485783)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "WAID:INBOUND123" {
+			t.Fatalf("source_id = %q, want WAID:INBOUND123", got)
+		}
+	})
+
+	t.Run("returns empty (no error) when the id is absent", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, body)
+		}))
+		defer srv.Close()
+		c := newTestClient(t, srv.URL)
+		got, err := c.GetMessageSourceID(202, 999999)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "" {
+			t.Fatalf("source_id = %q, want empty", got)
+		}
+	})
+
+	t.Run("zero args short-circuit without an HTTP call", func(t *testing.T) {
+		c := newTestClient(t, "http://127.0.0.1:0") // would fail if actually dialed
+		if got, err := c.GetMessageSourceID(0, 42); err != nil || got != "" {
+			t.Fatalf("GetMessageSourceID(0,42) = %q,%v; want \"\",nil", got, err)
+		}
+		if got, err := c.GetMessageSourceID(202, 0); err != nil || got != "" {
+			t.Fatalf("GetMessageSourceID(202,0) = %q,%v; want \"\",nil", got, err)
+		}
+	})
+}

@@ -673,8 +673,16 @@ func (c *Client) GetMessageSourceID(conversationID, messageID int) (string, erro
 		body, _ := io.ReadAll(resp.Body)
 		return "", &HTTPStatusError{StatusCode: resp.StatusCode, Op: "list messages", Body: string(body)}
 	}
+	// Decode into a minimal local shape rather than []Message: the REST
+	// messages endpoint types some fields differently from the webhook payload
+	// (notably message_type is a number here, "incoming"/"outgoing" string in
+	// the webhook), so decoding into Message would fail with a type error. We
+	// only need id and source_id, so read just those.
 	var result struct {
-		Payload []Message `json:"payload"`
+		Payload []struct {
+			ID       int    `json:"id"`
+			SourceID string `json:"source_id"`
+		} `json:"payload"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
