@@ -74,6 +74,57 @@ func TestHandleMessageReactionStoresReactionAndForwardsWebhook(t *testing.T) {
 	}
 }
 
+// A removal event carries an empty emoji, so handleMessage must read the
+// stored reaction before CreateReaction deletes it and carry the erased emoji
+// into the webhook payload.
+func TestHandleMessageReactionRemovalCarriesRemovedEmoji(t *testing.T) {
+	originalWebhookURLs := config.WhatsappWebhook
+	originalWebhookEvents := config.WhatsappWebhookEvents
+	originalAutoReply := config.WhatsappAutoReplyMessage
+	originalAutoMarkRead := config.WhatsappAutoMarkRead
+	originalSubmit := submitWebhookFn
+	originalLog := log
+	defer func() {
+		config.WhatsappWebhook = originalWebhookURLs
+		config.WhatsappWebhookEvents = originalWebhookEvents
+		config.WhatsappAutoReplyMessage = originalAutoReply
+		config.WhatsappAutoMarkRead = originalAutoMarkRead
+		submitWebhookFn = originalSubmit
+		log = originalLog
+	}()
+
+	log = waLog.Noop
+	config.WhatsappWebhook = []string{"https://example.test/webhook"}
+	config.WhatsappWebhookEvents = nil
+	config.WhatsappAutoReplyMessage = ""
+	config.WhatsappAutoMarkRead = false
+
+	repo := &messageHandlerRepoSpy{storedReaction: &domainChatStorage.Reaction{Emoji: "\U0001f44d"}}
+	done := make(chan map[string]any, 1)
+	submitWebhookFn = func(_ context.Context, payload map[string]any, _ string, _ *domainChatStorage.DeviceWebhookConfig) error {
+		done <- payload
+		return nil
+	}
+
+	handleMessage(context.Background(), reactionEventForTest("reaction-event-2", "msg-1", ""), repo, nil)
+
+	select {
+	case payload := <-done:
+		eventPayload, ok := payload["payload"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected payload map, got %T", payload["payload"])
+		}
+		if got := eventPayload["reaction"]; got != "" {
+			t.Fatalf("expected empty reaction on removal, got %v", got)
+		}
+		if got := eventPayload["removed_reaction"]; got != "\U0001f44d" {
+			t.Fatalf("expected removed emoji in webhook payload, got %v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for webhook submission")
+	}
+}
+
 func TestHandleWebhookForwardSkipsBroadcastRegardlessOfChatwoot(t *testing.T) {
 	originalWebhookURLs := config.WhatsappWebhook
 	originalWebhookEvents := config.WhatsappWebhookEvents
@@ -159,6 +210,7 @@ type messageHandlerRepoSpy struct {
 	mu                  sync.Mutex
 	createMessageCalls  int
 	createReactionCalls int
+	storedReaction      *domainChatStorage.Reaction
 }
 
 func (r *messageHandlerRepoSpy) CreateMessage(context.Context, *events.Message) error {
@@ -173,6 +225,10 @@ func (r *messageHandlerRepoSpy) CreateReaction(context.Context, *events.Message)
 	defer r.mu.Unlock()
 	r.createReactionCalls++
 	return nil
+}
+
+func (r *messageHandlerRepoSpy) GetReactionForEvent(context.Context, *events.Message) (*domainChatStorage.Reaction, error) {
+	return r.storedReaction, nil
 }
 
 func (r *messageHandlerRepoSpy) createMessageCount() int {

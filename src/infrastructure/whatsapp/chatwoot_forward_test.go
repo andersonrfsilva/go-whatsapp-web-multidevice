@@ -391,41 +391,20 @@ func TestBuildReactionChatwootContent(t *testing.T) {
 		name     string
 		payload  map[string]any
 		fromName string
-		preview  string
 		expected string
 	}{
 		{
-			name: "reaction quotes resolved message preview",
+			// The reacted-to message is not quoted: when reacted_message_id is
+			// present, syncPayloadToChatwoot already threads this note onto it
+			// via in_reply_to_external_id, so Chatwoot nests it under that
+			// message's bubble.
+			name: "reaction is just actor and emoji",
 			payload: map[string]any{
 				"reaction":           "👍",
 				"reacted_message_id": "wamid-123",
 			},
 			fromName: "Alice",
-			preview:  "bom dia, tudo certo?",
-			expected: "Alice reacted 👍 to “bom dia, tudo certo?”",
-		},
-		{
-			name: "reaction removal quotes resolved message preview",
-			payload: map[string]any{
-				"reaction":           "",
-				"reacted_message_id": "wamid-123",
-			},
-			fromName: "Alice",
-			preview:  "bom dia, tudo certo?",
-			expected: "Alice removed a reaction from “bom dia, tudo certo?”",
-		},
-		{
-			// The target id is not repeated in the text: when reacted_message_id
-			// is present, syncPayloadToChatwoot already threads this note onto
-			// the reacted-to message via in_reply_to_external_id, so Chatwoot
-			// nests it under that message's bubble.
-			name: "reaction with sender name and target id",
-			payload: map[string]any{
-				"reaction":           "👍",
-				"reacted_message_id": "wamid-123",
-			},
-			fromName: "Alice",
-			expected: "Alice reacted 👍",
+			expected: "Alice 👍",
 		},
 		{
 			name: "reaction falls back to phone",
@@ -435,10 +414,20 @@ func TestBuildReactionChatwootContent(t *testing.T) {
 				"from":               "628123456789@s.whatsapp.net",
 			},
 			fromName: "",
-			expected: "628123456789 reacted 🔥",
+			expected: "628123456789 🔥",
 		},
 		{
-			name: "reaction removal",
+			name: "reaction removal names the erased emoji",
+			payload: map[string]any{
+				"reaction":           "",
+				"removed_reaction":   "👍",
+				"reacted_message_id": "wamid-789",
+			},
+			fromName: "Bob",
+			expected: "Bob removed 👍",
+		},
+		{
+			name: "reaction removal without stored emoji",
 			payload: map[string]any{
 				"reaction":           "",
 				"reacted_message_id": "wamid-789",
@@ -447,124 +436,28 @@ func TestBuildReactionChatwootContent(t *testing.T) {
 			expected: "Bob removed a reaction",
 		},
 		{
-			name: "reaction falls back to sender jid when pushname missing",
-			payload: map[string]any{
-				"reaction":           "😂",
-				"reacted_message_id": "wamid-999",
-				"from":               "628777000111@s.whatsapp.net",
-			},
-			fromName: "",
-			expected: "628777000111 reacted 😂",
-		},
-		{
 			name: "missing target id still produces readable text",
 			payload: map[string]any{
 				"reaction": "❤️",
 			},
 			fromName: "Carol",
-			expected: "Carol reacted ❤️",
+			expected: "Carol ❤️",
+		},
+		{
+			name:     "unknown actor",
+			payload:  map[string]any{"reaction": "😂"},
+			fromName: "",
+			expected: "Someone 😂",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := buildReactionChatwootContent(tc.payload, tc.fromName, tc.preview); got != tc.expected {
+			if got := buildReactionChatwootContent(tc.payload, tc.fromName); got != tc.expected {
 				t.Fatalf("expected %q, got %q", tc.expected, got)
 			}
 		})
 	}
-}
-
-type reactedPreviewTestRepo struct {
-	chatstorage.IChatStorageRepository
-	byDevice map[string]*chatstorage.Message
-	byID     map[string]*chatstorage.Message
-}
-
-func (r *reactedPreviewTestRepo) GetMessageByIDAndDevice(deviceID, id string) (*chatstorage.Message, error) {
-	return r.byDevice[deviceID+"|"+id], nil
-}
-
-func (r *reactedPreviewTestRepo) GetMessageByID(id string) (*chatstorage.Message, error) {
-	return r.byID[id], nil
-}
-
-func TestReactedMessagePreview(t *testing.T) {
-	repo := &reactedPreviewTestRepo{
-		byDevice: map[string]*chatstorage.Message{
-			"device-1|wamid-text":  {Content: "  olá,\ncomo vai?  "},
-			"device-1|wamid-image": {MediaType: "image"},
-			"device-1|wamid-doc":   {MediaType: "document", Filename: "contrato.pdf"},
-			"device-1|wamid-long":  {Content: strings.Repeat("a", 100)},
-		},
-		byID: map[string]*chatstorage.Message{
-			"wamid-global": {Content: "mensagem global"},
-		},
-	}
-
-	tests := []struct {
-		name      string
-		deviceID  string
-		messageID string
-		expected  string
-	}{
-		{
-			name:      "text message collapses whitespace",
-			deviceID:  "device-1",
-			messageID: "wamid-text",
-			expected:  "olá, como vai?",
-		},
-		{
-			name:      "media without caption falls back to media type",
-			deviceID:  "device-1",
-			messageID: "wamid-image",
-			expected:  "(image)",
-		},
-		{
-			name:      "document includes filename",
-			deviceID:  "device-1",
-			messageID: "wamid-doc",
-			expected:  "(document: contrato.pdf)",
-		},
-		{
-			name:      "long content is truncated with ellipsis",
-			deviceID:  "device-1",
-			messageID: "wamid-long",
-			expected:  strings.Repeat("a", 80) + "…",
-		},
-		{
-			name:      "empty device id falls back to global lookup",
-			deviceID:  "",
-			messageID: "wamid-global",
-			expected:  "mensagem global",
-		},
-		{
-			name:      "unknown message yields empty preview",
-			deviceID:  "device-1",
-			messageID: "wamid-missing",
-			expected:  "",
-		},
-		{
-			name:      "empty message id yields empty preview",
-			deviceID:  "device-1",
-			messageID: "",
-			expected:  "",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := reactedMessagePreview(tc.deviceID, repo, tc.messageID); got != tc.expected {
-				t.Fatalf("expected %q, got %q", tc.expected, got)
-			}
-		})
-	}
-
-	t.Run("nil repo yields empty preview", func(t *testing.T) {
-		if got := reactedMessagePreview("device-1", nil, "wamid-text"); got != "" {
-			t.Fatalf("expected empty preview, got %q", got)
-		}
-	})
 }
 
 type replyAttrsTestRepo struct {

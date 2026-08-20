@@ -13,6 +13,11 @@ type IChatStorageRepository interface {
 	// Chat operations
 	CreateMessage(ctx context.Context, evt *events.Message) error
 	CreateReaction(ctx context.Context, evt *events.Message) error
+	// GetReactionForEvent returns the reaction currently stored for the
+	// (reacted message, reactor, device) triple addressed by a reaction event,
+	// or nil when none is stored. Callers use it to learn which emoji a
+	// removal event (empty reaction text) is about to erase.
+	GetReactionForEvent(ctx context.Context, evt *events.Message) (*Reaction, error)
 	// CreateIncomingCallRecord persists an incoming call as a synthetic message (media_type "call") for chat history.
 	CreateIncomingCallRecord(ctx context.Context, evt *events.CallOffer, autoRejected bool) error
 	StoreChat(chat *Chat) error
