@@ -1,6 +1,10 @@
 package whatsapp
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -614,5 +618,94 @@ func TestOneLineExcerpt(t *testing.T) {
 				t.Fatalf("oneLineExcerpt(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestSyncPayloadToChatwoot_ReactionEchoStampsSourceID is the regression test
+// for the echo race: an outgoing reaction note must carry the reaction's own
+// WAID as source_id so isEchoOfForwardedMessage (chatwoot.go) can drop the
+// webhook Chatwoot fires back for it, independent of the timing-sensitive
+// IsMessageSentByUs cache. Without the fix, source_id is empty on this path
+// and the synthetic "X reacted 👍 to ..." note gets sent back to WhatsApp.
+func TestSyncPayloadToChatwoot_ReactionEchoStampsSourceID(t *testing.T) {
+	var capturedBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/accounts/1/contacts/search":
+			// Echo the query term back as the contact's phone number so the
+			// client's own normalization always matches, whatever it computed.
+			q := r.URL.Query().Get("q")
+			writeTestJSON(t, w, http.StatusOK, map[string]any{
+				"payload": []map[string]any{
+					{"id": 7, "name": "Alice", "phone_number": q},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/accounts/1/contacts/7/conversations":
+			writeTestJSON(t, w, http.StatusOK, map[string]any{
+				"payload": []map[string]any{
+					{"id": 42, "inbox_id": 1, "status": "open"},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/accounts/1/conversations/42/messages":
+			if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
+				t.Fatalf("decode message-create body: %v", err)
+			}
+			writeTestJSON(t, w, http.StatusOK, map[string]any{"id": 999})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	cw := &chatwoot.Client{
+		BaseURL:    server.URL,
+		APIToken:   "t",
+		AccountID:  1,
+		InboxID:    1,
+		HTTPClient: server.Client(),
+	}
+	origGetClient := getChatwootClientFn
+	getChatwootClientFn = func() *chatwoot.Client { return cw }
+	defer func() { getChatwootClientFn = origGetClient }()
+
+	payload := map[string]any{"payload": map[string]any{
+		"id":                 "REACTION-ID-1",
+		"reacted_message_id": "ORIGINAL-ID-1",
+		"reaction":           "👍",
+		"from":               "628123456789@s.whatsapp.net",
+		"chat_id":            "628123456789@s.whatsapp.net",
+		"from_name":          "Alice",
+		"is_from_me":         true,
+	}}
+
+	if err := syncPayloadToChatwoot(context.Background(), payload, "message.reaction", "", nil); err != nil {
+		t.Fatalf("syncPayloadToChatwoot: %v", err)
+	}
+
+	if capturedBody == nil {
+		t.Fatal("message-create endpoint was never called")
+	}
+
+	sourceID, _ := capturedBody["source_id"].(string)
+	if sourceID != "WAID:REACTION-ID-1" {
+		t.Errorf("source_id = %q, want %q", sourceID, "WAID:REACTION-ID-1")
+	}
+	if sourceID == "WAID:ORIGINAL-ID-1" {
+		t.Fatal("source_id must be stamped from the reaction's own id, not reacted_message_id")
+	}
+
+	messageType, _ := capturedBody["message_type"].(string)
+	if messageType != "outgoing" {
+		t.Errorf("message_type = %q, want outgoing", messageType)
+	}
+}
+
+func writeTestJSON(t *testing.T, w http.ResponseWriter, status int, v any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		t.Fatalf("encode json response: %v", err)
 	}
 }

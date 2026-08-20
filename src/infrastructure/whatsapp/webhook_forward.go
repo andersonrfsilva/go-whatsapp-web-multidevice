@@ -1136,6 +1136,12 @@ func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventNam
 	case "message.reaction":
 		rid, _ := data["reacted_message_id"].(string)
 		content = buildReactionChatwootContent(data, info.FromName, reactedMessagePreview(deviceID, linkRepo, rid))
+		// The reaction's own WhatsApp id (not reacted_message_id) — without this
+		// stamp the outgoing note is invisible to isEchoOfForwardedMessage and can
+		// be sent back to WhatsApp when the sent-message cache loses the race.
+		if id, _ := data["id"].(string); id != "" {
+			msgOpts.SourceID = "WAID:" + id
+		}
 		if rid != "" {
 			// Thread the reaction onto the message it references. Besides the
 			// WAID external id (which only resolves for WAID-stamped contact
