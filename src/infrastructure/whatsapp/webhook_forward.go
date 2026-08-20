@@ -1137,7 +1137,13 @@ func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventNam
 		rid, _ := data["reacted_message_id"].(string)
 		content = buildReactionChatwootContent(data, info.FromName, reactedMessagePreview(deviceID, linkRepo, rid))
 		if rid != "" {
-			msgOpts.ContentAttributes = map[string]any{"in_reply_to_external_id": "WAID:" + rid}
+			// Thread the reaction onto the message it references. Besides the
+			// WAID external id (which only resolves for WAID-stamped contact
+			// messages), resolve the native in_reply_to via the message-link
+			// table so reactions to agent-authored messages (which carry no WAID
+			// source_id) also attach to the original in Chatwoot.
+			attrs, _ := buildChatwootReplyAttributes(deviceID, linkRepo, rid)
+			msgOpts.ContentAttributes = attrs
 		}
 	case "message.edited", "message.revoked", "message.deleted":
 		var threadID string
