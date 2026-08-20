@@ -34,6 +34,11 @@ func handleMessage(ctx context.Context, evt *events.Message, chatStorageRepo dom
 	evt = materializeSecretEditMessage(ctx, evt, client)
 
 	if isReactionMessage(evt) {
+		// A removal event carries an empty emoji, so capture the emoji it is
+		// about to erase before CreateReaction deletes the stored row - the
+		// webhook payload (and the Chatwoot note) can then name it.
+		ctx = withRemovedReactionEmoji(ctx, evt, chatStorageRepo)
+
 		if err := chatStorageRepo.CreateReaction(ctx, evt); err != nil {
 			log.Errorf("Failed to store incoming reaction %s: %v", evt.Info.ID, err)
 		}

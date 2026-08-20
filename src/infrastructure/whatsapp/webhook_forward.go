@@ -600,18 +600,16 @@ func isEventWhitelistedForChatwoot(eventName string) bool {
 	return false
 }
 
-// buildReactionChatwootContent renders the note posted for a reaction event.
-// reactedPreview is a short human-readable excerpt of the message that was
-// reacted to (empty when it could not be resolved from local chat storage);
-// with a preview the note quotes the original message.
+// buildReactionChatwootContent renders the note posted for a reaction event:
+// just the actor and the emoji ("Anderson R 👍").
 //
-// It never mentions the raw WhatsApp message id: whenever reacted_message_id
-// is present, syncPayloadToChatwoot already threads this note onto the
-// reacted-to message via ContentAttributes.in_reply_to_external_id, so
-// Chatwoot nests it under that message's bubble - repeating the raw id in
-// the text would just be noise. When reacted_message_id is absent the note
-// is posted standalone, un-threaded, but still readable.
-func buildReactionChatwootContent(data map[string]any, fromName, reactedPreview string) string {
+// It quotes nothing and never mentions the raw WhatsApp message id: whenever
+// reacted_message_id is present, syncPayloadToChatwoot already threads this
+// note onto the reacted-to message via ContentAttributes.in_reply_to_external_id,
+// so Chatwoot nests it under that message's bubble - restating the original
+// text would just be noise. When reacted_message_id is absent the note is
+// posted standalone, un-threaded, but still readable.
+func buildReactionChatwootContent(data map[string]any, fromName string) string {
 	reaction, _ := data["reaction"].(string)
 
 	actor := "Someone"
@@ -621,59 +619,16 @@ func buildReactionChatwootContent(data map[string]any, fromName, reactedPreview 
 		actor = utils.ExtractPhoneFromJID(from)
 	}
 
-	if reactedPreview != "" {
-		if reaction == "" {
-			return fmt.Sprintf("%s removed a reaction from “%s”", actor, reactedPreview)
-		}
-		return fmt.Sprintf("%s reacted %s to “%s”", actor, reaction, reactedPreview)
-	}
-
 	if reaction == "" {
+		if removed, _ := data["removed_reaction"].(string); removed != "" {
+			return fmt.Sprintf("%s removed %s", actor, removed)
+		}
 		return fmt.Sprintf("%s removed a reaction", actor)
 	}
-	return fmt.Sprintf("%s reacted %s", actor, reaction)
+	return fmt.Sprintf("%s %s", actor, reaction)
 }
 
-const reactedMessagePreviewMaxRunes = 80
-
-// reactedMessagePreview resolves the reacted-to message from local chat
-// storage and returns a short one-line excerpt for the Chatwoot note. Media
-// messages without a caption fall back to their type/filename. Returns ""
-// when the message is not stored locally, so the caller keeps the id-based
-// fallback text.
-func reactedMessagePreview(deviceID string, repo domainChatStorage.IChatStorageRepository, messageID string) string {
-	if repo == nil || messageID == "" {
-		return ""
-	}
-
-	var (
-		msg *domainChatStorage.Message
-		err error
-	)
-	if deviceID != "" {
-		msg, err = repo.GetMessageByIDAndDevice(deviceID, messageID)
-	} else {
-		msg, err = repo.GetMessageByID(messageID)
-	}
-	if err != nil {
-		logrus.Warnf("Chatwoot: Failed to load reacted message %s: %v", messageID, err)
-		return ""
-	}
-	if msg == nil {
-		return ""
-	}
-
-	preview := strings.TrimSpace(msg.Content)
-	if preview == "" && msg.MediaType != "" {
-		if filename := strings.TrimSpace(msg.Filename); filename != "" {
-			preview = fmt.Sprintf("(%s: %s)", msg.MediaType, filename)
-		} else {
-			preview = "(" + msg.MediaType + ")"
-		}
-	}
-
-	return oneLineExcerpt(preview, reactedMessagePreviewMaxRunes)
-}
+const quotedExcerptMaxRunes = 80
 
 // oneLineExcerpt collapses whitespace/newlines into single spaces and truncates
 // to maxRunes (appending an ellipsis), so quoted excerpts stay on one line.
@@ -1379,7 +1334,7 @@ func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventNam
 	switch eventName {
 	case "message.reaction":
 		rid, _ := data["reacted_message_id"].(string)
-		content = buildReactionChatwootContent(data, info.FromName, reactedMessagePreview(deviceID, linkRepo, rid))
+		content = buildReactionChatwootContent(data, info.FromName)
 		// The reaction's own WhatsApp id (not reacted_message_id) — without this
 		// stamp the outgoing note is invisible to isEchoOfForwardedMessage and can
 		// be sent back to WhatsApp when the sent-message cache loses the race.
@@ -1422,7 +1377,7 @@ func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventNam
 			// fall back to quoting the replied-to text inline.
 			if !linked {
 				if quoted, _ := data["quoted_body"].(string); strings.TrimSpace(quoted) != "" {
-					quote := "> " + oneLineExcerpt(quoted, reactedMessagePreviewMaxRunes)
+					quote := "> " + oneLineExcerpt(quoted, quotedExcerptMaxRunes)
 					if content == "" {
 						content = quote
 					} else {
