@@ -14,12 +14,25 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/sirupsen/logrus"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 )
 
 var (
-	submitWebhookFn     = submitWebhook
-	getChatwootClientFn = chatwoot.GetDefaultClient
+	submitWebhookFn = submitWebhook
+	// getChatwootClientFn resolves the per-device Chatwoot destination for the
+	// forward path. Returns (nil, nil) when the device simply has no usable config
+	// (caller skips silently). Returns ErrClientRegistryUnavailable when the
+	// registry has not been initialized yet — a distinct condition that must NOT
+	// be mistaken for "no config", or a due retry would be marked done and a live
+	// forward dropped without delivery. Overridable in tests.
+	getChatwootClientFn = func(deviceID string) (*chatwoot.ResolvedConfig, error) {
+		reg := chatwoot.GetClientRegistry()
+		if reg == nil {
+			return nil, chatwoot.ErrClientRegistryUnavailable
+		}
+		return reg.Resolve(deviceID)
+	}
 	// contactDisplayNameFn resolves the operator-saved address-book name for a
 	// 1:1 JID from the WhatsApp contact store. It is a seam so tests can stub
 	// the lookup without a real client/store.
@@ -94,7 +107,8 @@ func forwardPayloadToConfiguredWebhooks(ctx context.Context, payload map[string]
 		webhookConfig = nil
 	}
 
-	webhookAllowed := isEventWhitelistedForDevice(eventName, webhookConfig)
+	webhookAllowed := isEventWhitelistedForDevice(eventName, webhookConfig) &&
+		!shouldIgnoreWebhookJID(payload)
 	chatwootAllowed := config.ChatwootEnabled && shouldForwardEventToChatwoot(eventName) && isEventWhitelistedForChatwoot(eventName)
 
 	if !webhookAllowed && !chatwootAllowed {
@@ -190,6 +204,33 @@ func isEventWhitelistedForDevice(eventName string, deviceConfig *domainChatStora
 		return false
 	}
 	return len(config.WhatsappWebhookEvents) == 0 || isEventWhitelisted(eventName)
+}
+
+// shouldIgnoreWebhookJID reports whether an event should be skipped for WHATSAPP_WEBHOOK
+// forwarding because its chat or sender JID matches WHATSAPP_WEBHOOK_IGNORE_JIDS (e.g. the
+// "@g.us" wildcard to drop all group traffic). The JID fields live in the nested inner
+// payload, so it descends one level. Both the resolved phone JIDs (chat_id/from) and the
+// LID forms (chat_lid/from_lid) are matched: a LID-migrated event keeps the @lid JID in the
+// *_lid fields while chat_id/from hold the resolved phone JID, so an "@lid" pattern (or an
+// exact ...@lid) only matches via the *_lid fields. It is a no-op when the ignore list is
+// empty, the inner payload is absent, or no JID matches — so events without a JID and the
+// default (no list configured) keep forwarding unchanged. This only gates the generic
+// webhook; the Chatwoot path keeps its own CHATWOOT_IGNORE_JIDS filter.
+func shouldIgnoreWebhookJID(payload map[string]any) bool {
+	ignore := config.WhatsappWebhookIgnoreJids
+	if len(ignore) == 0 {
+		return false
+	}
+	data, ok := payload["payload"].(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, key := range []string{"chat_id", "from", "chat_lid", "from_lid"} {
+		if jid, _ := data[key].(string); utils.MatchesIgnoredJID(jid, ignore) {
+			return true
+		}
+	}
+	return false
 }
 
 // addWebhookSessionID injects the operator-facing session id into a webhook
@@ -487,6 +528,30 @@ func buildChatwootMessageContent(data map[string]any, isGroup bool, fromName str
 		logrus.Infof("Chatwoot: Found %s attachment at %s", field, path)
 	}
 
+	// interactive_media carries zero or more paths collected from an
+	// InteractiveMessage's header and, for carousels, every card's header
+	// (see collectInteractiveMedia in event_message.go) — a plain []string
+	// rather than one of the singular mediaFields above, since a carousel
+	// can have media on more than one card and reusing e.g. "image" would
+	// have each extraction overwrite the last. []any covers the shape after
+	// a JSON round-trip on the Chatwoot forward retry path.
+	switch paths := data["interactive_media"].(type) {
+	case []string:
+		for _, path := range paths {
+			if path != "" {
+				attachments = append(attachments, path)
+				logrus.Infof("Chatwoot: Found interactive media attachment at %s", path)
+			}
+		}
+	case []any:
+		for _, v := range paths {
+			if path, ok := v.(string); ok && path != "" {
+				attachments = append(attachments, path)
+				logrus.Infof("Chatwoot: Found interactive media attachment at %s", path)
+			}
+		}
+	}
+
 	// Empty content with no attachments is left as-is: the caller skips the
 	// message instead of posting a placeholder. These payloads come from events
 	// that have no rendering in the WhatsApp chat either (poll votes, protocol
@@ -535,14 +600,19 @@ func isEventWhitelistedForChatwoot(eventName string) bool {
 	return false
 }
 
-// buildReactionChatwootContent renders a WhatsApp reaction event into a
-// Chatwoot note. reactedPreview is a short excerpt of the message that was
+// buildReactionChatwootContent renders the note posted for a reaction event.
+// reactedPreview is a short human-readable excerpt of the message that was
 // reacted to (empty when it could not be resolved from local chat storage);
-// with a preview the note quotes the original message, otherwise it falls
-// back to referencing the raw WhatsApp message id.
+// with a preview the note quotes the original message.
+//
+// It never mentions the raw WhatsApp message id: whenever reacted_message_id
+// is present, syncPayloadToChatwoot already threads this note onto the
+// reacted-to message via ContentAttributes.in_reply_to_external_id, so
+// Chatwoot nests it under that message's bubble - repeating the raw id in
+// the text would just be noise. When reacted_message_id is absent the note
+// is posted standalone, un-threaded, but still readable.
 func buildReactionChatwootContent(data map[string]any, fromName, reactedPreview string) string {
 	reaction, _ := data["reaction"].(string)
-	reactedMessageID, _ := data["reacted_message_id"].(string)
 
 	actor := "Someone"
 	if fromName != "" {
@@ -556,13 +626,6 @@ func buildReactionChatwootContent(data map[string]any, fromName, reactedPreview 
 			return fmt.Sprintf("%s removed a reaction from “%s”", actor, reactedPreview)
 		}
 		return fmt.Sprintf("%s reacted %s to “%s”", actor, reaction, reactedPreview)
-	}
-
-	if reactedMessageID != "" {
-		if reaction == "" {
-			return fmt.Sprintf("%s removed a reaction from message %s", actor, reactedMessageID)
-		}
-		return fmt.Sprintf("%s reacted %s to message %s", actor, reaction, reactedMessageID)
 	}
 
 	if reaction == "" {
@@ -757,7 +820,155 @@ func extractStructuredMessageContent(data map[string]any) string {
 		return "Order message"
 	}
 
+	if interactive, ok := data["interactive"].(string); ok && interactive != "" {
+		// Pre-rendered by buildOtherMessageTypes at construction time (not
+		// stored as the raw proto) so it survives the JSON round-trip on the
+		// Chatwoot forward retry path; see the comment at that call site.
+		return interactive
+	}
+
 	return ""
+}
+
+// formatInteractiveMessageSummary renders an InteractiveMessage (business/
+// Cloud API messages with native buttons: cta_url, cta_call, single/multi
+// select, etc.) as plain text, since Chatwoot has no native concept of a
+// WhatsApp interactive button. Buttons are described in buttonParamsJSON as
+// a per-button-type JSON blob (undocumented, reverse-engineered from
+// traffic), so only the fields relevant to rendering are decoded and
+// anything unrecognized still shows the button's raw name.
+func formatInteractiveMessageSummary(im *waE2E.InteractiveMessage) string {
+	var parts []string
+
+	if header := im.GetHeader(); header != nil {
+		if title := header.GetTitle(); title != "" {
+			parts = append(parts, title)
+		}
+		if subtitle := header.GetSubtitle(); subtitle != "" {
+			parts = append(parts, subtitle)
+		}
+		// Media captions on interactive headers never reach payload["body"]
+		// (ExtractMediaCaption only handles top-level Get*Message() cases,
+		// not InteractiveMessage.Header) — surface them here instead of
+		// silently dropping them, since collectInteractiveMedia forwards the
+		// file itself but nothing else carries the caption text.
+		if caption := interactiveHeaderMediaCaption(header); caption != "" {
+			parts = append(parts, caption)
+		}
+	}
+	if body := im.GetBody(); body != nil {
+		if text := body.GetText(); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	if footer := im.GetFooter(); footer != nil {
+		if text := footer.GetText(); text != "" {
+			parts = append(parts, text)
+		}
+	}
+
+	for _, button := range im.GetNativeFlowMessage().GetButtons() {
+		if line := formatNativeFlowButton(button); line != "" {
+			parts = append(parts, line)
+		}
+	}
+
+	// Carousels put their CTA/quick-reply buttons on each card rather than on
+	// the top-level NativeFlowMessage, so the loop above sees none of them —
+	// summarize each card (itself a full InteractiveMessage) separately.
+	if carousel := im.GetCarouselMessage(); carousel != nil {
+		for i, card := range carousel.GetCards() {
+			if cardSummary := formatInteractiveMessageSummary(card); cardSummary != "" && cardSummary != "Interactive message" {
+				parts = append(parts, fmt.Sprintf("Card %d: %s", i+1, cardSummary))
+			}
+		}
+	}
+
+	if len(parts) == 0 {
+		return "Interactive message"
+	}
+	return strings.Join(parts, "\n")
+}
+
+// interactiveHeaderMediaCaption returns the caption on whichever media type
+// (if any) an InteractiveMessage header carries. Mirrors utils.ExtractMediaCaption's
+// per-type checks, scoped to the Header oneof instead of top-level Get*Message().
+func interactiveHeaderMediaCaption(header *waE2E.InteractiveMessage_Header) string {
+	if header == nil {
+		return ""
+	}
+	if img := header.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := header.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := header.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+	return ""
+}
+
+// nativeFlowButtonParams covers the fields used by the button types this
+// forwarder renders specially (cta_url, cta_call, cta_copy). Other button
+// names (e.g. single_select, review_and_pay) fall through to displaying the
+// raw button name, since their params carry structured picker/payment data
+// that doesn't reduce to a single line of text.
+type nativeFlowButtonParams struct {
+	DisplayText string `json:"display_text"`
+	URL         string `json:"url"`
+	PhoneNumber string `json:"phone_number"`
+	Copy        string `json:"copy_code"`
+	// Title is the visible label field used by picker-style buttons (e.g.
+	// single_select's {"title":...,"sections":...}), which don't set
+	// display_text at all.
+	Title string `json:"title"`
+}
+
+func formatNativeFlowButton(button *waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton) string {
+	if button == nil {
+		return ""
+	}
+	name := button.GetName()
+
+	var params nativeFlowButtonParams
+	_ = json.Unmarshal([]byte(button.GetButtonParamsJSON()), &params)
+
+	switch name {
+	case "cta_url":
+		label := params.DisplayText
+		if label == "" {
+			label = "Link"
+		}
+		if params.URL != "" {
+			return fmt.Sprintf("🔗 %s: %s", label, params.URL)
+		}
+	case "cta_call":
+		label := params.DisplayText
+		if label == "" {
+			label = "Call"
+		}
+		if params.PhoneNumber != "" {
+			return fmt.Sprintf("📞 %s: %s", label, params.PhoneNumber)
+		}
+	case "cta_copy":
+		label := params.DisplayText
+		if label == "" {
+			label = "Copy code"
+		}
+		if params.Copy != "" {
+			return fmt.Sprintf("📋 %s: %s", label, params.Copy)
+		}
+	}
+
+	label := params.DisplayText
+	if label == "" {
+		label = params.Title
+	}
+	if label != "" {
+		return fmt.Sprintf("[%s] %s", name, label)
+	}
+	return fmt.Sprintf("[%s]", name)
 }
 
 func extractContactDetails(contact any) (name string, phone string, ok bool) {
@@ -840,7 +1051,7 @@ func syncMessageToChatwoot(cw *chatwoot.Client, info *chatwootContactInfo, conte
 	if err != nil {
 		return nil, fmt.Errorf("failed to create message: %w", err)
 	}
-	chatwoot.MarkMessageAsSent(msgID)
+	chatwoot.MarkMessageAsSent(cw.AccountID, msgID)
 
 	logrus.Infof("Chatwoot: Message synced successfully for %s", info.Identifier)
 	return &chatwootSyncResult{
@@ -868,7 +1079,7 @@ func chatwootLinkStorageFromContext(ctx context.Context) (string, domainChatStor
 	return deviceID, instance.GetChatStorage()
 }
 
-func buildChatwootForwardMessageLink(deviceID string, data map[string]any, opts chatwoot.MessageOptions, result *chatwootSyncResult) *domainChatStorage.ChatwootMessageLink {
+func buildChatwootForwardMessageLink(deviceID string, configID int64, accountID int, data map[string]any, opts chatwoot.MessageOptions, result *chatwootSyncResult) *domainChatStorage.ChatwootMessageLink {
 	if result == nil || deviceID == "" || result.MessageID == 0 {
 		return nil
 	}
@@ -889,6 +1100,8 @@ func buildChatwootForwardMessageLink(deviceID string, data map[string]any, opts 
 		SourceID:                     opts.SourceID,
 		Direction:                    chatwootMessageTypeFromPayload(data),
 		IsRead:                       false,
+		ChatwootConfigID:             configID,
+		ChatwootAccountID:            accountID,
 	}
 }
 
@@ -955,6 +1168,12 @@ func syncReadReceiptsToChatwoot(cw *chatwoot.Client, deviceID string, linkRepo d
 		if link == nil || link.ChatwootConversationID == 0 {
 			continue
 		}
+		if !chatwootLinkMatchesClient(link, cw) {
+			// The link was written under a different Chatwoot account (e.g. before
+			// a delete-and-recreate rebind): its conversation id means nothing on
+			// the current destination.
+			continue
+		}
 
 		sourceID := link.ChatwootContactInboxSourceID
 		if sourceID == "" {
@@ -993,12 +1212,29 @@ func deleteLinkedChatwootMessage(cw *chatwoot.Client, deviceID string, linkRepo 
 	if link == nil || link.ChatwootConversationID == 0 || link.ChatwootMessageID == 0 {
 		return false
 	}
+	if !chatwootLinkMatchesClient(link, cw) {
+		// Cross-account link (pre-rebind): the (conversation, message) ids would
+		// address an unrelated message on the current destination.
+		return false
+	}
 
 	if err := cw.DeleteMessage(link.ChatwootConversationID, link.ChatwootMessageID); err != nil {
 		logrus.Errorf("Chatwoot: Failed to delete Chatwoot message %d for WhatsApp %s: %v", link.ChatwootMessageID, targetID, err)
 		return false
 	}
 	return true
+}
+
+// chatwootLinkMatchesClient reports whether a stored message link belongs to
+// the Chatwoot account the client is bound to. Links with account id 0
+// (pre-migration legacy rows not yet backfilled) are accepted for
+// compatibility; any other mismatch means the link predates a rebind and its
+// Chatwoot ids must not be replayed against the current destination.
+func chatwootLinkMatchesClient(link *domainChatStorage.ChatwootMessageLink, cw *chatwoot.Client) bool {
+	if link == nil || cw == nil {
+		return false
+	}
+	return link.ChatwootAccountID == 0 || link.ChatwootAccountID == cw.AccountID
 }
 
 func chatwootForwardMessageID(payload map[string]any) string {
@@ -1083,13 +1319,21 @@ func enqueueChatwootForwardRetry(linkRepo domainChatStorage.IChatStorageReposito
 }
 
 func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventName, deviceID string, linkRepo domainChatStorage.IChatStorageRepository) error {
-	cw := getChatwootClientFn()
-	if cw == nil {
-		logrus.Warn("Chatwoot: Client is not initialized")
+	resolved, err := getChatwootClientFn(deviceID)
+	if err != nil {
+		// Transient resolution failure (e.g. storage error): let the caller retry.
+		logrus.Warnf("Chatwoot: failed to resolve client for device %s: %v", deviceID, err)
+		return err
+	}
+	if resolved == nil || resolved.Client == nil {
+		// No Chatwoot config maps to this device (and env fallback does not apply).
+		// Skip silently — this is fail-fast, not an error to retry.
+		logrus.Debugf("Chatwoot: no Chatwoot config for device %s; skipping forward", deviceID)
 		return nil
 	}
+	cw := resolved.Client
 	if !cw.IsConfigured() {
-		logrus.Warn("Chatwoot: Client is not configured (check CHATWOOT_* env vars)")
+		logrus.Warn("Chatwoot: Client is not configured (check CHATWOOT_* env vars or device config)")
 		return nil
 	}
 
@@ -1210,7 +1454,7 @@ func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventNam
 		return err
 	}
 	if eventName == "message" && linkRepo != nil {
-		if link := buildChatwootForwardMessageLink(deviceID, data, msgOpts, result); link != nil {
+		if link := buildChatwootForwardMessageLink(deviceID, resolved.ConfigID, cw.AccountID, data, msgOpts, result); link != nil {
 			if err := linkRepo.UpsertChatwootMessageLink(link); err != nil {
 				logrus.Errorf("Chatwoot: Failed to store message link for %s: %v", link.WhatsAppMessageID, err)
 			}
@@ -1236,7 +1480,17 @@ func processChatwootForwardRetryEvent(repo domainChatStorage.IChatStorageReposit
 	if err := json.Unmarshal([]byte(event.PayloadJSON), &payload); err != nil {
 		return fmt.Errorf("decode retry payload %d: %w", event.ID, err)
 	}
-	return syncPayloadToChatwoot(context.Background(), payload, event.EventName, event.DeviceID, repo)
+	// Rebuild the device context the live path had: group-name and avatar
+	// lookups resolve the WhatsApp client from the context and would otherwise
+	// fall back to the global default device — the wrong client in multi-device
+	// deployments.
+	ctx := context.Background()
+	if dm := GetDeviceManager(); dm != nil {
+		if instance, _, err := dm.ResolveDevice(event.DeviceID); err == nil && instance != nil {
+			ctx = ContextWithDevice(ctx, instance)
+		}
+	}
+	return syncPayloadToChatwoot(ctx, payload, event.EventName, event.DeviceID, repo)
 }
 
 func processDueChatwootForwardRetries(repo domainChatStorage.IChatStorageRepository) {

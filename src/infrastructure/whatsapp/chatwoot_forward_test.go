@@ -3,6 +3,7 @@ package whatsapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,29 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 )
+
+// TestSyncPayloadToChatwootFailFast verifies the forward path skips silently
+// (no error, no retry) when the device resolves to no Chatwoot config, and
+// propagates a transient resolution error so the caller can retry.
+func TestSyncPayloadToChatwootFailFast(t *testing.T) {
+	orig := getChatwootClientFn
+	t.Cleanup(func() { getChatwootClientFn = orig })
+
+	payload := map[string]any{"payload": map[string]any{"id": "wa-1", "chat_id": "628@s.whatsapp.net"}}
+
+	// No config for this device -> skip, return nil.
+	getChatwootClientFn = func(string) (*chatwoot.ResolvedConfig, error) { return nil, nil }
+	if err := syncPayloadToChatwoot(context.Background(), payload, "message", "dev-unmapped", nil); err != nil {
+		t.Fatalf("unmapped device should skip with nil, got %v", err)
+	}
+
+	// Transient resolution error -> propagate (retryable).
+	wantErr := errors.New("storage down")
+	getChatwootClientFn = func(string) (*chatwoot.ResolvedConfig, error) { return nil, wantErr }
+	if err := syncPayloadToChatwoot(context.Background(), payload, "message", "dev", nil); !errors.Is(err, wantErr) {
+		t.Fatalf("resolution error should propagate, got %v", err)
+	}
+}
 
 func TestChatwootMessageTypeFromPayload(t *testing.T) {
 	tests := []struct {
@@ -64,6 +88,8 @@ func TestBuildChatwootForwardMessageLink(t *testing.T) {
 
 	link := buildChatwootForwardMessageLink(
 		"device-a@s.whatsapp.net",
+		42, // configID
+		3,  // accountID
 		data,
 		chatwoot.MessageOptions{SourceID: "WAID:wa-live-1"},
 		&chatwootSyncResult{MessageID: 123, ConversationID: 456, InboxID: 789},
@@ -80,6 +106,9 @@ func TestBuildChatwootForwardMessageLink(t *testing.T) {
 	}
 	if link.ChatwootMessageID != 123 || link.ChatwootConversationID != 456 || link.ChatwootInboxID != 789 {
 		t.Fatalf("unexpected chatwoot ids: %+v", link)
+	}
+	if link.ChatwootConfigID != 42 || link.ChatwootAccountID != 3 {
+		t.Fatalf("unexpected scope ids: config=%d account=%d", link.ChatwootConfigID, link.ChatwootAccountID)
 	}
 	if link.Direction != "incoming" {
 		t.Fatalf("Direction = %q, want incoming", link.Direction)
@@ -386,13 +415,17 @@ func TestBuildReactionChatwootContent(t *testing.T) {
 			expected: "Alice removed a reaction from “bom dia, tudo certo?”",
 		},
 		{
+			// The target id is not repeated in the text: when reacted_message_id
+			// is present, syncPayloadToChatwoot already threads this note onto
+			// the reacted-to message via in_reply_to_external_id, so Chatwoot
+			// nests it under that message's bubble.
 			name: "reaction with sender name and target id",
 			payload: map[string]any{
 				"reaction":           "👍",
 				"reacted_message_id": "wamid-123",
 			},
 			fromName: "Alice",
-			expected: "Alice reacted 👍 to message wamid-123",
+			expected: "Alice reacted 👍",
 		},
 		{
 			name: "reaction falls back to phone",
@@ -402,7 +435,7 @@ func TestBuildReactionChatwootContent(t *testing.T) {
 				"from":               "628123456789@s.whatsapp.net",
 			},
 			fromName: "",
-			expected: "628123456789 reacted 🔥 to message wamid-456",
+			expected: "628123456789 reacted 🔥",
 		},
 		{
 			name: "reaction removal",
@@ -411,7 +444,7 @@ func TestBuildReactionChatwootContent(t *testing.T) {
 				"reacted_message_id": "wamid-789",
 			},
 			fromName: "Bob",
-			expected: "Bob removed a reaction from message wamid-789",
+			expected: "Bob removed a reaction",
 		},
 		{
 			name: "reaction falls back to sender jid when pushname missing",
@@ -421,7 +454,7 @@ func TestBuildReactionChatwootContent(t *testing.T) {
 				"from":               "628777000111@s.whatsapp.net",
 			},
 			fromName: "",
-			expected: "628777000111 reacted 😂 to message wamid-999",
+			expected: "628777000111 reacted 😂",
 		},
 		{
 			name: "missing target id still produces readable text",
@@ -666,7 +699,9 @@ func TestSyncPayloadToChatwoot_ReactionEchoStampsSourceID(t *testing.T) {
 		HTTPClient: server.Client(),
 	}
 	origGetClient := getChatwootClientFn
-	getChatwootClientFn = func() *chatwoot.Client { return cw }
+	getChatwootClientFn = func(string) (*chatwoot.ResolvedConfig, error) {
+		return &chatwoot.ResolvedConfig{Client: cw}, nil
+	}
 	defer func() { getChatwootClientFn = origGetClient }()
 
 	payload := map[string]any{"payload": map[string]any{

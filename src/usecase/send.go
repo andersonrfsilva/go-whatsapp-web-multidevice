@@ -26,7 +26,7 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest/helpers"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
 	"github.com/disintegration/imaging"
-	fiberUtils "github.com/gofiber/fiber/v2/utils"
+	fiberUtils "github.com/gofiber/utils/v2"
 	"github.com/sirupsen/logrus"
 	"github.com/valyala/fasthttp"
 	"go.mau.fi/whatsmeow"
@@ -68,15 +68,18 @@ func (service serviceSend) wrapSendMessage(ctx context.Context, client *whatsmeo
 
 	// Store message asynchronously with timeout.
 	// Preserve device context (for device_id scoping) but detach from request cancellation.
+	// The budget must survive chat-storage write contention (history sync batches
+	// hold the SQLite writer for a while; busy_timeout is 30s) — with a short
+	// deadline the sent message is silently missing from the chat viewer.
 	go func() {
-		storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
 
 		if err := service.chatStorageRepo.StoreSentMessageWithContext(storeCtx, ts.ID, senderJID, recipient.String(), content, ts.Timestamp, msg); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				logrus.Warn("Timeout storing sent message")
+				logrus.Warnf("Timeout storing sent message %s to %s", ts.ID, recipient.String())
 			} else {
-				logrus.Warnf("Failed to store sent message: %v", err)
+				logrus.Warnf("Failed to store sent message %s to %s: %v", ts.ID, recipient.String(), err)
 			}
 		}
 	}()
@@ -221,6 +224,11 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 		}()
 	}()
 
+	// Prefix every temp file with a UUID, as the video path already does.
+	// Without it two concurrent sends of the same filename share one path on
+	// disk and the async cleanup below deletes the other request's files.
+	generateUUID := fiberUtils.UUIDv4()
+
 	if request.ImageURL != nil && *request.ImageURL != "" {
 		// Download image from URL
 		imageData, fileName, err := utils.DownloadImageFromURL(*request.ImageURL)
@@ -253,20 +261,20 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 			imageData = pngBuffer.Bytes()
 		}
 
-		oriImagePath = fmt.Sprintf("%s/%s", config.PathSendItems, fileName)
-		imageName = fileName
+		imageName = generateUUID + fileName
+		oriImagePath = fmt.Sprintf("%s/%s", config.PathSendItems, imageName)
 		err = os.WriteFile(oriImagePath, imageData, 0644)
 		if err != nil {
 			return response, pkgError.InternalServerError(fmt.Sprintf("failed to save downloaded image %v", err))
 		}
 	} else if request.Image != nil {
 		// Save image to server
-		oriImagePath = fmt.Sprintf("%s/%s", config.PathSendItems, request.Image.Filename)
+		imageName = generateUUID + request.Image.Filename
+		oriImagePath = fmt.Sprintf("%s/%s", config.PathSendItems, imageName)
 		err = fasthttp.SaveMultipartFile(request.Image, oriImagePath)
 		if err != nil {
 			return response, err
 		}
-		imageName = request.Image.Filename
 	}
 	deletedItems = append(deletedItems, oriImagePath)
 
@@ -988,9 +996,11 @@ func (service serviceSend) SendLink(ctx context.Context, request domainSend.Link
 		logrus.Debugf("Image dimensions: Square image or dimensions not available")
 	}
 
+	messageText := buildLinkMessageText(request.Caption, request.Link)
+
 	// Create the message
 	msg := &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-		Text:          proto.String(fmt.Sprintf("%s\n%s", request.Caption, request.Link)),
+		Text:          proto.String(messageText),
 		Title:         proto.String(metadata.Title),
 		MatchedText:   proto.String(request.Link),
 		Description:   proto.String(metadata.Description),
@@ -1032,11 +1042,7 @@ func (service serviceSend) SendLink(ctx context.Context, request domainSend.Link
 		}
 	}
 
-	content := "🔗 " + request.Link
-	if request.Caption != "" {
-		content = "🔗 " + request.Caption
-	}
-	ts, err := service.wrapSendMessage(ctx, client, dataWaRecipient, msg, content)
+	ts, err := service.wrapSendMessage(ctx, client, dataWaRecipient, msg, messageText)
 	if err != nil {
 		return response, err
 	}
@@ -1044,6 +1050,17 @@ func (service serviceSend) SendLink(ctx context.Context, request domainSend.Link
 	response.MessageID = ts.ID
 	response.Status = fmt.Sprintf("Link sent to %s (server timestamp: %s)", request.BaseRequest.Phone, ts.Timestamp.String())
 	return response, nil
+}
+
+func buildLinkMessageText(caption, link string) string {
+	caption = strings.TrimSpace(caption)
+	link = strings.TrimSpace(link)
+
+	if caption == "" {
+		return link
+	}
+
+	return fmt.Sprintf("%s\n%s", caption, link)
 }
 
 func (service serviceSend) SendLocation(ctx context.Context, request domainSend.LocationRequest) (response domainSend.GenericResponse, err error) {
