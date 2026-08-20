@@ -1,0 +1,51 @@
+# Estado atual (sempre sobrescrito — não é histórico)
+
+Snapshot vivo do projeto; atualizar aqui a cada sessão relevante. Para o histórico
+por data, ver os arquivos `handoff/HANDOFF-*.md` (nunca editar os antigos).
+
+*Última atualização: 2026-07-27.*
+
+- Branch `main`, 15 commits à frente de `origin/main` (upstream aldinokemal — **não
+  pushar**).
+- **Mudança não commitada** em `src/infrastructure/whatsapp/webhook_forward.go`
+  (`syncPayloadToChatwoot`, case `message.reaction`): troca o `ContentAttributes` que só
+  setava `in_reply_to_external_id: "WAID:" + rid` por uma chamada a
+  `buildChatwootReplyAttributes(deviceID, linkRepo, rid)`. Objetivo: threadar reações também
+  em mensagens de origem sem WAID (ex. mensagens autoradas pelo agente), resolvendo o
+  `in_reply_to` nativo via a tabela de message-link além do WAID external id. **Inspecionar
+  e testar antes de qualquer novo trabalho em cima** — ainda não commitada nem validada em
+  produção.
+- Produção parcialmente atualizada: fix do quote Chatwoot (imagem `gowa-pr739:quote-fix3`,
+  commit `69ac2e8`) rodando **só na instância `zap9273`** (validado 2026-07-18). `zap8586`,
+  `zap5827` e `zapvig` seguem na imagem antiga `reply-threading` (sem o fix).
+
+### Pendências
+
+- Atualizar `zap8586`/`zap5827`/`zapvig` para a imagem com o fix de quote.
+- Plano **006** (`plans/006-chatwoot-webhook-auth-hardening.md`) — hardening do webhook
+  inbound do Chatwoot (dropar query-secret, warn em unauth, warn em HMAC key default): TODO.
+- Plano **001** (extensão de arquivo em documentos sem extensão) — `plans/README.md` marca
+  BLOCKED, mas os commits `808b7f6` (fix) + `87d6fb1` (teste/regressão) já resolveram isso em
+  `src/pkg/utils/whatsapp.go`. **Confirmar e atualizar o status em `plans/README.md`.**
+- **Wave 2** (catalogado em `plans/README.md`, sem plano escrito ainda):
+  - #007-catálogo — SSRF nos `Download*FromURL`/`GetMetaDataFromURL` (sem validação de
+    host/IP; alcançável sem auth via anexo do webhook Chatwoot).
+  - #008 — SRI/versões de CDN desatualizadas na UI admin (jQuery 3.1.1, axios 1.1.2, sem
+    `integrity=`).
+  - #009a-d — batch de performance no hot path (SELECT duplicado, UPDATE-then-INSERT em vez
+    de upsert, download de imagem duplicado, HTTP client recriado por chamada).
+  - #005 — CI de PR rodando `go build/vet/test/gofmt` (hoje só há workflows de
+    release/publish).
+  - #004 — env vars mortas em `.env.example` + gofmt drift em 2 arquivos.
+- **Wave 3** (precisa de design, não de fix cego):
+  - Tirar escrita de DB / download de mídia / mark-read da goroutine de dispatch do
+    whatsmeow (serialização por chat, sem `go` ingênuo).
+  - Cache de contato/conversa Chatwoot para cortar round-trips REST por mensagem
+    encaminhada.
+  - Spike de design `ChatwootSink` — interface + ponto de injeção único para reduzir a
+    superfície de conflito da camada Chatwoot com o upstream (hoje toca 10+ arquivos,
+    `webhook_forward.go` 1168 linhas, `sqlite_repository.go` 2113, `usecase/send.go` 1830).
+  - Cobertura de testes: `usecase/` 3,6%, `ui/rest/` 6,5%, event handlers e retry worker 0%.
+- Detalhes completos, evidências e findings rejeitados (com rationale): `plans/README.md`
+  (auditoria `/improve` de 2026-07-06).
+- **Bloqueios:** nenhum conhecido.
