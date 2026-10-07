@@ -1,45 +1,76 @@
 ---
 name: new-release
-description: Use when publishing a new stable GitHub release for this project after updating its hardcoded AppVersion.
+description: Publish a stable GOWA release. Use only for an explicit $new-release vX.Y.Z invocation.
 ---
 
-# New Release
+# New release
 
-Release only an already-prepared, tested `main` commit. This skill never edits source, release notes, tags, or releases except for the single confirmed tag push.
+Publish from a clean, current `main` checkout of
+`aldinokemal/go-whatsapp-web-multidevice`: update only `AppVersion`, validate, commit,
+push `main`, push the matching tag, and verify the release created by `release.yml`.
+Release-note editing is a separate task; do not run `gh release create`.
 
-## Argument contract
+## Input and boundaries
 
-Accept exactly one argument: a stable version matching `^v[0-9]+\.[0-9]+\.[0-9]+$` (for example, `$new-release v9.1.0`). Reject missing, extra, malformed, whitespace-padded, or prerelease/build-metadata versions. On rejection, stop before preflight and require a new invocation in the literal form `$new-release v9.1.0`; do not request an action token or a bare version. Do not normalize input.
-
-## Safety rules
-
-- Never edit `AppVersion`, release notes, or any repository file. Stop and tell the user to prepare those changes separately.
-- Never run `gh release create`.
-- Never force, move, overwrite, reuse, or delete tags or releases.
-- Treat only the documented absence statuses as availability. Stop on every command, network, authentication, authorization, parsing, or API error.
+- Accept exactly one stable version matching `^v[0-9]+\.[0-9]+\.[0-9]+$`.
+  Reject missing/extra arguments, surrounding whitespace, prereleases, and build
+  metadata without normalizing them. Ask for a corrected `$new-release vX.Y.Z` invocation.
+- Keep the explicit release gate: no source edits, commits, or pushes before the
+  user replies exactly `yes` to the confirmation below. A confirmation already
+  received for this same checked release remains valid; do not ask again.
+- Run Git/GitHub commands from `git rev-parse --show-toplevel`; run Go from `src/`.
+  Never force, move, overwrite, reuse, or delete branches, tags, or releases.
+- Authentication, permission, network, or parsing failures do not prove absence.
+  Stop on failed checks; do not repair repository state or retry failed publishing mutations.
 
 ## Preflight
 
-1. Resolve the repository root with `git rev-parse --show-toplevel` and run every command from it. Read fetch URLs with `git remote get-url --all origin` and push URLs with `git remote get-url --push --all origin`. Require each command to succeed and return exactly one nonempty URL; call them `fetch_url` and `push_url`. Normalize each with `gh repo view <url> --json nameWithOwner --jq .nameWithOwner` and require both to equal `aldinokemal/go-whatsapp-web-multidevice`; require `gh auth status` to succeed.
-2. Run `git fetch origin main --tags --prune`. Require branch `main`, an empty `git status --porcelain=v1`, and `git rev-parse HEAD` exactly equal to `git rev-parse origin/main`.
-3. In `src/config/settings.go`, find exactly one declaration matching `^\s*AppVersion\s*=`. Extract its quoted value and require exact equality with the requested version; otherwise stop without editing it.
-4. Check the exact local ref `refs/tags/<version>` with `git show-ref --verify --quiet`. Continue only on its expected absent exit status; stop if present or if any other error occurs. Check the exact remote ref on `push_url` with `git ls-remote --exit-code --refs --tags <push_url> refs/tags/<version>`; continue only on exit status `2` (absent), stop on `0` (present) or any other result.
-5. Perform an exact GitHub Release lookup with `gh api -i repos/aldinokemal/go-whatsapp-web-multidevice/releases/tags/<version>`. Continue only after an explicit HTTP `404` not-found response. Stop if a release is returned or the response is any other API, network, authentication, authorization, or permission error.
-6. Run `go test ./...` from `src/` and require success. Return to the repository root. Record `validated_sha=$(git rev-parse HEAD)` and `subject=$(git log -1 --format=%s "$validated_sha")`.
-7. Show the exact repository, requested version, detected `AppVersion`, full validated SHA, and subject. Output this confirmation prompt verbatim, replacing only placeholders: `Push tag <version> at <validated_sha>? [yes/no]` Do not paraphrase it or add signing, release-creation, or other actions.
+1. Read all `origin` fetch and push URLs with `git remote get-url --all origin` and
+   `git remote get-url --push --all origin`. Each must return exactly one nonempty URL.
+   Resolve each with `gh repo view <url> --json nameWithOwner --jq .nameWithOwner`;
+   both must equal the repository above. Require successful `gh auth status`.
+2. Fetch `origin main --tags --prune`. Require branch `main`, clean
+   `git status --porcelain=v1`, and `HEAD == origin/main`. Record the full `base_sha`
+   and subject. In `src/config/settings.go`, require exactly one `AppVersion`
+   declaration with a quoted stable `current_version` different from the requested version.
+3. Establish tag/release absence: local `git show-ref --verify --quiet refs/tags/<version>`
+   must exit `1`; remote `git ls-remote --exit-code --refs --tags <push_url> refs/tags/<version>`
+   must exit `2`; `gh api -i repos/aldinokemal/go-whatsapp-web-multidevice/releases/tags/<version>`
+   must return explicit HTTP `404`. A present ref/release or any other error stops the workflow.
+4. Show the repository, requested/current versions, full `base_sha`, and subject. Ask:
+   `Update AppVersion to <version>, commit, push main, and tag the release? [yes/no]`
 
-## Confirmation and tag push
+## Publish after confirmation
 
-Stop without mutation unless the user replies `yes` affirmatively. Immediately before any mutation, repeat the fetch/push URL collection, exactly-one-nonempty-URL, and repository-identity checks above, then run `git fetch origin main --tags --prune` to refresh remote state. Require branch `main`, empty porcelain status, `HEAD`, freshly read `origin/main`, and the validated SHA all equal `validated_sha`; recheck the exact local and remote tag absence using the same expected-status rules above, and recheck that the exact GitHub Release lookup returns explicit HTTP `404`.
+Recheck preflight facts immediately before editing: URLs/repository/auth, clean
+`main`, fresh `origin/main == HEAD == base_sha`, unchanged `current_version`, and
+exact tag/release absence. If any differs, stop and report the changed fact.
 
-Only then run `git tag <version> <validated_sha>` followed by `git push origin refs/tags/<version>:refs/tags/<version>`. Do not add force flags or push any other ref. If tag creation fails, stop and report it. If the push fails, do not retry, delete, force, or clean up: read back the exact local ref and the exact remote ref on the sole validated `push_url` using the same checks above, and report each as `present`, `absent`, or `unknown` when its read-back has an operational error; then stop.
+1. Replace only the quoted `AppVersion` value. Require `git diff --check` and verify
+   that the entire diff is that one replacement in `src/config/settings.go`.
+2. Run `go test ./...` from `src/` and require success. This validates the release
+   candidate; do not also require an unchanged baseline suite before confirmation.
+3. Stage only `src/config/settings.go`; verify the staged diff is still exactly
+   that version replacement. Commit `chore(release): <version>` and record the full
+   `release_sha`, which must differ from `base_sha`.
+4. Push `origin HEAD:refs/heads/main`, fetch `origin main --tags --prune`, and require
+   `HEAD == origin/main == release_sha`. Recheck local/remote tag and release absence.
+5. Create `git tag <version> <release_sha>` and push only
+   `origin refs/tags/<version>:refs/tags/<version>`.
 
-## Workflow verification
+## Completion and failure
 
-For no more than two minutes after the push, poll `gh run list --workflow release.yml --branch <version> --json databaseId,event,headSha,status,conclusion,url --limit 20`. Select only a run whose `event` is `push` and whose `headSha` equals `validated_sha`; show each observed status/progress. Stop and report failure if no matching push run appears before the deadline.
+After the tag push, allow up to two minutes for `gh run list --workflow release.yml
+--branch <version> --json databaseId,event,headSha,status,conclusion,url --limit 20`
+to show a `push` run with `headSha == release_sha`. This deadline is for run
+appearance, not build completion. Follow the matching run to a terminal result
+and require success; report its URL and any failed jobs.
 
-Run `gh run watch <run-id> --exit-status`. Require success and report its terminal state and URL. Then run `gh release view <version> --json tagName,isDraft,isPrerelease,url,publishedAt,targetCommitish`; require exact `tagName`, `isDraft=false`, and `isPrerelease=false`, then report the published release URL. Stop and report any mismatch or lookup error.
+Read `gh release view <version> --json tagName,isDraft,isPrerelease,url,publishedAt,targetCommitish`.
+Require the exact tag, a published non-draft/non-prerelease release, and
+`targetCommitish == release_sha` before reporting the release URL as complete.
 
-## Failure reporting
-
-On every stop, state the failed check, the observed safe evidence, and that no further mutation was performed. After a push failure, include the exact local and remote tag read-back states, preserving `unknown` for any read-back error. Do not suggest changing version state, creating a release directly, reusing an existing tag, or deleting a failed tag. After a pushed tag, report the failed workflow or release evidence and ask the user for direction.
+On failure, report the failed check and completed mutations. After a commit/main
+push, include local and freshly read remote SHA/status evidence. After a tag-push
+failure, report exact local/remote refs as present, absent, or unknown on read errors.
+Do not retry, reset, delete, or clean up failed publishing state; ask for direction.
