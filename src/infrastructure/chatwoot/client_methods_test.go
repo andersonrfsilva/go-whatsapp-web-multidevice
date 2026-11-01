@@ -3,7 +3,6 @@ package chatwoot
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -12,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
@@ -742,16 +742,99 @@ func TestFindOrCreateConversation_CreatesWhenNotFound(t *testing.T) {
 	}
 }
 
-func TestFindOrCreateConversation_SwallowsFindErrorThenCreates(t *testing.T) {
-	// Listing conversations failing is logged but NOT propagated: the method
-	// still proceeds to create. This codifies the current swallow-and-create
-	// behavior — a find error must not block conversation creation.
+// TestFindOrCreateConversation_ListFailureCreatesNothing: when the contact's
+// conversations cannot be read, no conversation is created. The contact may
+// well have an open one, and a new thread would split the customer's
+// messages over two conversations. The error keeps its status, so a transient
+// failure is retried by the caller and the message lands in the right thread
+// once the list can be read again.
+func TestFindOrCreateConversation_ListFailureCreatesNothing(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status    int
+		retryable bool
+	}{
+		"server error":      {http.StatusInternalServerError, true},
+		"bad gateway":       {http.StatusBadGateway, true},
+		"too many requests": {http.StatusTooManyRequests, true},
+		"unauthorized":      {http.StatusUnauthorized, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var creates atomic.Int32
+			listFails := atomic.Bool{}
+			listFails.Store(true)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && listFails.Load():
+					writeJSON(t, w, tc.status, map[string]any{"error": "find failed"})
+				case r.Method == http.MethodGet:
+					writeJSON(t, w, http.StatusOK, map[string]any{"payload": []map[string]any{{"id": 20, "inbox_id": 2, "status": "open"}}})
+				case r.Method == http.MethodPost:
+					creates.Add(1)
+					writeJSON(t, w, http.StatusOK, map[string]any{"payload": map[string]any{"id": 800}})
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+				}
+			}))
+			defer server.Close()
+
+			c := newTestClient(t, server.URL)
+			conv, err := c.FindOrCreateConversation(7, "")
+			if err == nil {
+				t.Fatalf("FindOrCreateConversation returned conversation %+v for an unreadable conversation list", conv)
+			}
+			if creates.Load() != 0 {
+				t.Fatalf("%d conversation(s) were created although the contact's conversations could not be read", creates.Load())
+			}
+			var statusErr *HTTPStatusError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != tc.status {
+				t.Fatalf("error = %v, want it to carry status %d", err, tc.status)
+			}
+			if Retryable(err) != tc.retryable {
+				t.Fatalf("Retryable(%v) = %v, want %v", err, Retryable(err), tc.retryable)
+			}
+
+			// The retry, once Chatwoot answers again, finds the open
+			// conversation and still creates nothing.
+			listFails.Store(false)
+			conv, err = c.FindOrCreateConversation(7, "")
+			if err != nil || conv == nil || conv.ID != 20 {
+				t.Fatalf("retry = %+v, %v; want the existing conversation 20", conv, err)
+			}
+			if creates.Load() != 0 {
+				t.Fatalf("%d conversation(s) were created on the retry", creates.Load())
+			}
+		})
+	}
+}
+
+// TestFindOrCreateConversation_NetworkFailureCreatesNothing: the same for a
+// failure without a status (connection refused, timeout).
+func TestFindOrCreateConversation_NetworkFailureCreatesNothing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	c := newTestClient(t, server.URL)
+	server.Close()
+
+	conv, err := c.FindOrCreateConversation(7, "")
+	if err == nil || conv != nil {
+		t.Fatalf("FindOrCreateConversation = %+v, %v; want an error and no conversation", conv, err)
+	}
+	if !Retryable(err) {
+		t.Fatalf("a network failure must stay retryable, got %v", err)
+	}
+}
+
+// TestFindOrCreateConversation_UnknownContactStillReportsTheCreateError: a 404
+// for the list means Chatwoot does not know the contact. The create is still
+// attempted and its own answer is what the caller gets, as before.
+func TestFindOrCreateConversation_UnknownContactStillReportsTheCreateError(t *testing.T) {
+	var creates atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet:
-			writeJSON(t, w, http.StatusInternalServerError, map[string]any{"error": "find failed"})
-		case r.Method == http.MethodPost:
-			writeJSON(t, w, http.StatusOK, map[string]any{"payload": map[string]any{"id": 800}})
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(t, w, http.StatusNotFound, map[string]any{"error": "Resource could not be found"})
+		case http.MethodPost:
+			creates.Add(1)
+			writeJSON(t, w, http.StatusNotFound, map[string]any{"error": "Resource could not be found"})
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
@@ -759,12 +842,11 @@ func TestFindOrCreateConversation_SwallowsFindErrorThenCreates(t *testing.T) {
 	defer server.Close()
 
 	c := newTestClient(t, server.URL)
-	conv, err := c.FindOrCreateConversation(7, "")
-	if err != nil {
-		t.Fatalf("FindOrCreateConversation should swallow find error, got: %v", err)
+	if _, err := c.FindOrCreateConversation(7, ""); err == nil {
+		t.Fatal("expected the create error for a contact Chatwoot does not know")
 	}
-	if conv.ID != 800 {
-		t.Fatalf("conv.ID = %d, want 800 (created after find error)", conv.ID)
+	if creates.Load() != 1 {
+		t.Fatalf("creates = %d, want the one attempt", creates.Load())
 	}
 }
 
@@ -1289,7 +1371,17 @@ func TestCreateMessage_AttachmentMissingIDReturnsZero(t *testing.T) {
 
 // --- Echo dedup map (MarkMessageAsSent / IsMessageSentByUs) ----------------
 
+// resetEchoDedup empties the package-global echo-dedup map for the duration of
+// a test and again when it ends, so a test neither sees ids left by an earlier
+// test (or an earlier -count iteration) nor leaves its own behind.
+func resetEchoDedup(t *testing.T) {
+	t.Helper()
+	sentMessageIDs.Clear()
+	t.Cleanup(sentMessageIDs.Clear)
+}
+
 func TestEchoDedup_MapBehavior(t *testing.T) {
+	resetEchoDedup(t)
 	const acc = 1
 	// MarkMessageAsSent(_, 0) is a no-op and IsMessageSentByUs(_, 0) is always
 	// false: id 0 is the "no id" sentinel returned by CreateMessage and must
@@ -1299,9 +1391,7 @@ func TestEchoDedup_MapBehavior(t *testing.T) {
 		t.Error("IsMessageSentByUs(acc, 0) = true, want false")
 	}
 
-	// A real id, once marked, is recognized as ours. We use a large, fixed
-	// id unlikely to collide with anything (the map is package-global and
-	// shared, but this exact value is only touched here). IsMessageSentByUs
+	// A real id, once marked, is recognized as ours. IsMessageSentByUs
 	// does not delete on read, so it stays true on a second check — Chatwoot
 	// fires multiple webhook events for one message.
 	const id = 987654321
@@ -1322,105 +1412,12 @@ func TestEchoDedup_MapBehavior(t *testing.T) {
 	}
 }
 
-// --- GetMessageSourceID ----------------------------------------------------
-
-func TestGetMessageSourceID(t *testing.T) {
-	// pagedMessagesHandler mimics Chatwoot's GET conversations/{id}/messages:
-	// message_type is a NUMBER (0=incoming, 1=outgoing, 2=activity) — the shape
-	// that broke the first version (it decoded into []Message whose MessageType
-	// is a string). It also paginates: ~20 messages per page, newest first,
-	// backward via ?before=<id>. Messages 100..140 exist; only the inbound one
-	// at id 105 carries a source_id, and it sits on the SECOND page — so a
-	// single-page lookup (the earlier bug) would miss it.
-	const pageSize = 20
-	pagedMessagesHandler := func(t *testing.T) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodGet {
-				t.Errorf("method = %s, want GET", r.Method)
-			}
-			if got := r.Header.Get("api_access_token"); got != "token" {
-				t.Errorf("api_access_token = %q, want token", got)
-			}
-			if want := "/api/v1/accounts/1/conversations/202/messages"; r.URL.Path != want {
-				t.Errorf("path = %q, want %q", r.URL.Path, want)
-			}
-			before := 1 << 30
-			if b := r.URL.Query().Get("before"); b != "" {
-				if _, err := fmt.Sscanf(b, "%d", &before); err != nil {
-					t.Errorf("bad before=%q", b)
-				}
-			}
-			// Collect ids < before, keep the highest pageSize, ascending order.
-			var ids []int
-			for i := 140; i >= 100; i-- {
-				if i < before {
-					ids = append(ids, i)
-					if len(ids) == pageSize {
-						break
-					}
-				}
-			}
-			// ids currently descending; emit ascending like real Chatwoot.
-			var b strings.Builder
-			b.WriteString(`{"payload":[`)
-			for k := len(ids) - 1; k >= 0; k-- {
-				id := ids[k]
-				if k != len(ids)-1 {
-					b.WriteByte(',')
-				}
-				if id == 105 {
-					fmt.Fprintf(&b, `{"id":%d,"message_type":0,"content_type":0,"source_id":"WAID:FOUND105"}`, id)
-				} else {
-					fmt.Fprintf(&b, `{"id":%d,"message_type":1,"content_type":0,"source_id":null}`, id)
-				}
-			}
-			b.WriteString(`]}`)
-			_, _ = io.WriteString(w, b.String())
-		}
-	}
-
-	t.Run("resolves inbound source_id found on a later page", func(t *testing.T) {
-		srv := httptest.NewServer(pagedMessagesHandler(t))
-		defer srv.Close()
-		c := newTestClient(t, srv.URL)
-		got, err := c.GetMessageSourceID(202, 105)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got != "WAID:FOUND105" {
-			t.Fatalf("source_id = %q, want WAID:FOUND105", got)
-		}
-	})
-
-	t.Run("returns empty (no error) when the id is absent", func(t *testing.T) {
-		srv := httptest.NewServer(pagedMessagesHandler(t))
-		defer srv.Close()
-		c := newTestClient(t, srv.URL)
-		got, err := c.GetMessageSourceID(202, 999) // never present; paging stops at floor
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got != "" {
-			t.Fatalf("source_id = %q, want empty", got)
-		}
-	})
-
-	t.Run("zero args short-circuit without an HTTP call", func(t *testing.T) {
-		c := newTestClient(t, "http://127.0.0.1:0") // would fail if actually dialed
-		if got, err := c.GetMessageSourceID(0, 42); err != nil || got != "" {
-			t.Fatalf("GetMessageSourceID(0,42) = %q,%v; want \"\",nil", got, err)
-		}
-		if got, err := c.GetMessageSourceID(202, 0); err != nil || got != "" {
-			t.Fatalf("GetMessageSourceID(202,0) = %q,%v; want \"\",nil", got, err)
-		}
-	})
-}
-
 // TestEchoDedup_AccountPartitioned guards multi-account routing: the same
 // numeric Chatwoot message id in two different accounts must not collide, or a
 // message we sent in account A would suppress a genuine agent reply with the
 // same id in account B (dropped reply).
 func TestEchoDedup_AccountPartitioned(t *testing.T) {
+	resetEchoDedup(t)
 	const id = 555111222
 	const accA, accB = 11, 22
 

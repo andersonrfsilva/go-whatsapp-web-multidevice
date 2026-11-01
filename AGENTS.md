@@ -5,6 +5,20 @@ técnicas) vive em [CLAUDE.md](CLAUDE.md) e em `docs/`. Este arquivo cobre só o
 precisa saber **antes de editar código**: onde mexer para cada tarefa e as regras que não dá
 para deduzir olhando um arquivo isolado.
 
+## WhatsApp protocol verification
+
+- [whatsmeow](https://github.com/tulir/whatsmeow) is GOWA's base WhatsApp library.
+  Every agent working on WhatsApp protocol behavior must verify relevant assumptions
+  against upstream source and documentation before implementing or reviewing changes.
+- Use the version pinned in `src/go.mod` (and any applicable module replacement).
+  Inspect the matching module source or upstream revision; do not assume upstream
+  `main` matches GOWA's dependency. This applies to messages, events, JIDs, receipts,
+  presence, authentication, sessions, and protocol types.
+- Identify the upstream files or symbols checked in the work summary. If the relevant
+  source is unavailable or behavior remains uncertain, state that limitation rather
+  than claiming protocol verification. Preserve GOWA's own API contracts and
+  application behavior when integrating upstream behavior.
+
 ## Onde mexer (tarefas comuns)
 
 | Tarefa | Onde |

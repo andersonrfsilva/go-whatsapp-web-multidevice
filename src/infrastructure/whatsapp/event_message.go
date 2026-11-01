@@ -107,6 +107,7 @@ func buildEventPayload(ctx context.Context, client *whatsmeow.Client, evt *event
 	if pushname := evt.Info.PushName; pushname != "" {
 		payload["from_name"] = pushname
 	}
+	buildBusinessFields(evt, payload)
 
 	// Modern WhatsApp clients (LID-migrated accounts on recent app builds) wrap
 	// message edits in a SecretEncryptedMessage with encType=MESSAGE_EDIT instead
@@ -215,6 +216,7 @@ func payloadHasNoRenderableContent(payload map[string]any) bool {
 		"image", "audio", "video", "video_note", "document", "sticker",
 		"contact", "contacts_array", "list", "live_location", "location", "order",
 		"template", "buttons", "product", "selection", "interactive",
+		"album",
 	}
 	for _, key := range renderableKeys {
 		if _, ok := payload[key]; ok {
@@ -247,6 +249,7 @@ func hasRecognizedMessageType(msg *waE2E.Message) bool {
 		msg.GetTemplateMessage() != nil,
 		msg.GetButtonsMessage() != nil,
 		msg.GetProductMessage() != nil,
+		msg.GetAlbumMessage() != nil,
 		msg.GetListResponseMessage() != nil,
 		msg.GetButtonsResponseMessage() != nil,
 		msg.GetTemplateButtonReplyMessage() != nil,
@@ -288,6 +291,22 @@ func buildFromFields(ctx context.Context, client *whatsmeow.Client, evt *events.
 
 	normalizedSenderJID := NormalizeJIDFromLID(ctx, senderJID, client)
 	payload["from"] = normalizedSenderJID.ToNonAD().String()
+}
+
+// buildBusinessFields exposes optional upstream verified-name certificate fields
+// on incoming messages. Certificate absence does not establish account type,
+// and the raw verification level does not guarantee an official badge.
+func buildBusinessFields(evt *events.Message, payload map[string]any) {
+	if evt.Info.IsFromMe || evt.Info.VerifiedName == nil {
+		return
+	}
+	payload["is_business"] = true
+	if name := evt.Info.VerifiedName.Details.GetVerifiedName(); name != "" {
+		payload["verified_name"] = name
+	}
+	if level := evt.Info.VerifiedName.VerifiedLevel; level != "" {
+		payload["verified_level"] = level
+	}
 }
 
 func buildMessageBody(ctx context.Context, client *whatsmeow.Client, evt *events.Message, payload map[string]any) error {
@@ -356,8 +375,36 @@ func buildOptionalFields(ctx context.Context, client *whatsmeow.Client, evt *eve
 	}
 
 	buildOtherMessageTypes(msg, payload)
+	buildAlbumFields(evt, msg, payload)
 
 	return nil
+}
+
+// buildAlbumFields exposes WhatsApp's media album grouping. When several photos or
+// videos are sent together, WhatsApp first sends an AlbumMessage carrying only the
+// expected counts, then each item as a regular image/video message linked to it
+// through messageContextInfo.messageAssociation (type MEDIA_ALBUM). Without this the
+// album header reaches consumers as an empty, unsupported message and the items
+// cannot be grouped.
+func buildAlbumFields(evt *events.Message, msg *waE2E.Message, payload map[string]any) {
+	if album := msg.GetAlbumMessage(); album != nil {
+		payload["album"] = map[string]any{
+			"expected_image_count": album.GetExpectedImageCount(),
+			"expected_video_count": album.GetExpectedVideoCount(),
+		}
+		return
+	}
+
+	association := evt.Message.GetMessageContextInfo().GetMessageAssociation()
+	if association == nil {
+		association = msg.GetMessageContextInfo().GetMessageAssociation()
+	}
+	if association.GetAssociationType() != waE2E.MessageAssociation_MEDIA_ALBUM {
+		return
+	}
+	if parentID := association.GetParentMessageKey().GetID(); parentID != "" {
+		payload["album_id"] = parentID
+	}
 }
 
 func buildMediaFields(ctx context.Context, client *whatsmeow.Client, msg *waE2E.Message, payload map[string]any) error {
@@ -605,50 +652,6 @@ func buildOtherMessageTypes(msg *waE2E.Message, payload map[string]any) {
 		// (see enqueueChatwootForwardRetry/replayChatwootForwardEvent), which
 		// turns *waE2E.InteractiveMessage into a generic map[string]any.
 		payload["interactive"] = utils.FormatInteractiveMessageSummary(interactiveMessage)
-	}
-
-	if poll := buildWebhookPollPayload(msg); poll != nil {
-		payload["poll"] = poll
-	}
-}
-
-// buildWebhookPollPayload flattens the poll-creation variants (V1-V6) into a
-// single {question, options} map. V4 wraps the real message in a
-// FutureProofMessage envelope, so it is unwrapped before lookup. Poll votes
-// (PollUpdateMessage) are intentionally excluded: they carry encrypted vote
-// data and have no rendering in the WhatsApp chat itself.
-func buildWebhookPollPayload(msg *waE2E.Message) map[string]any {
-	if msg == nil {
-		return nil
-	}
-	poll := msg.GetPollCreationMessage()
-	if poll == nil {
-		poll = msg.GetPollCreationMessageV2()
-	}
-	if poll == nil {
-		poll = msg.GetPollCreationMessageV3()
-	}
-	if poll == nil {
-		poll = msg.GetPollCreationMessageV5()
-	}
-	if poll == nil {
-		poll = msg.GetPollCreationMessageV6()
-	}
-	if poll == nil {
-		if fp := msg.GetPollCreationMessageV4(); fp != nil && fp.GetMessage() != nil {
-			return buildWebhookPollPayload(fp.GetMessage())
-		}
-		return nil
-	}
-	options := make([]string, 0, len(poll.GetOptions()))
-	for _, opt := range poll.GetOptions() {
-		if name := opt.GetOptionName(); name != "" {
-			options = append(options, name)
-		}
-	}
-	return map[string]any{
-		"question": poll.GetName(),
-		"options":  options,
 	}
 }
 

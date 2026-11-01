@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -9,7 +10,9 @@ import (
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
+	domainSend "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/send"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -175,8 +178,39 @@ func TestComposeOutgoingText(t *testing.T) {
 			want:      "*Agent Smith*\n\nhello",
 		},
 		{
+			// Links are flattened in the agent's body; the signature is added
+			// around the converted text.
+			name:      "sign enabled flattens markdown link in body",
+			signMsg:   true,
+			delimiter: "\n\n",
+			content:   "see [**https://x.example/**](https://x.example/) and [docs](https://x.example/a_b?c=1\\&d=2)",
+			sender:    "Bob",
+			want:      "*Bob*\n\nsee https://x.example/ and docs: https://x.example/a_b?c=1&d=2",
+		},
+		{
+			// Chatwoot's own "send with signature" switch with an empty
+			// signature leaves a dangling separator line; it is dropped.
+			name:      "dangling chatwoot signature separator dropped",
+			signMsg:   true,
+			delimiter: "\n\n",
+			content:   "Thanks\n\n--\n\n",
+			sender:    "Bob",
+			want:      "*Bob*\n\nThanks",
+		},
+		{
+			// A message that is only the separator has no body: nothing is
+			// sent as text (an attachment then goes out without a caption),
+			// and no lone agent name either.
+			name:      "only chatwoot signature separator returns empty",
+			signMsg:   true,
+			delimiter: "\n\n",
+			content:   "\n\n--\n\n",
+			sender:    "Bob",
+			want:      "",
+		},
+		{
 			// Plain text with no markdown delimiters is passed through unchanged
-			// (the markdown translator short-circuits when no * ~ are present).
+			// (the markdown translator skips text that holds no Markdown).
 			name:      "plain text no markdown unchanged",
 			signMsg:   false,
 			delimiter: "\n\n",
@@ -388,207 +422,151 @@ func TestChatwootLinkChatJID(t *testing.T) {
 	}
 }
 
-func TestChatwootInReplyToID(t *testing.T) {
+// chatwootReplySendStub records what an agent reply makes the webhook send.
+// The embedded interface is nil, so any send the tests do not expect panics.
+type chatwootReplySendStub struct {
+	domainSend.ISendUsecase
+	texts    []string
+	captions []string // one entry per attachment sent, in order
+}
+
+func (s *chatwootReplySendStub) SendText(_ context.Context, request domainSend.MessageRequest) (domainSend.GenericResponse, error) {
+	s.texts = append(s.texts, request.Message)
+	return domainSend.GenericResponse{Status: "ok"}, nil
+}
+
+func (s *chatwootReplySendStub) SendImage(_ context.Context, request domainSend.ImageRequest) (domainSend.GenericResponse, error) {
+	s.captions = append(s.captions, "image:"+request.Caption)
+	return domainSend.GenericResponse{Status: "ok"}, nil
+}
+
+func (s *chatwootReplySendStub) SendFile(_ context.Context, request domainSend.FileRequest) (domainSend.GenericResponse, error) {
+	s.captions = append(s.captions, "file:"+request.Caption)
+	return domainSend.GenericResponse{Status: "ok"}, nil
+}
+
+// TestChatwootWebhookEmptyReplyText drives the webhook end to end with a stub
+// send usecase: a reply whose text comes out empty (nothing, or only Chatwoot's
+// "--" signature separator) must not be sent as a text message, and must not
+// become the caption of its attachments, which are still delivered.
+func TestChatwootWebhookEmptyReplyText(t *testing.T) {
+	const attachments = `[{"id":1,"file_type":"image","data_url":"https://chat.example/a.png"},{"id":2,"file_type":"file","data_url":"https://chat.example/b.pdf"}]`
 	tests := []struct {
-		name  string
-		attrs map[string]any
-		want  int
+		name         string
+		content      string
+		attachments  string
+		wantTexts    []string
+		wantCaptions []string
 	}{
-		{name: "json number decodes as float64", attrs: map[string]any{"in_reply_to": float64(123)}, want: 123},
-		{name: "int is accepted", attrs: map[string]any{"in_reply_to": 456}, want: 456},
-		{name: "numeric string is accepted", attrs: map[string]any{"in_reply_to": " 789 "}, want: 789},
-		{name: "non-numeric string yields zero", attrs: map[string]any{"in_reply_to": "abc"}, want: 0},
-		{name: "missing key yields zero", attrs: map[string]any{}, want: 0},
-		{name: "nil attrs yields zero", attrs: nil, want: 0},
-		{name: "nil value yields zero", attrs: map[string]any{"in_reply_to": nil}, want: 0},
+		{
+			name:    "separator only sends nothing",
+			content: `\n\n--\n\n`,
+		},
+		{
+			name:    "bare separator sends nothing",
+			content: `--`,
+		},
+		{
+			name:    "empty content sends nothing",
+			content: ``,
+		},
+		{
+			// Control: the same route does send a reply that has a body, with
+			// the dangling separator dropped and the agent's name added.
+			name:      "body with dangling separator is sent as text",
+			content:   `Thanks\n\n--\n\n`,
+			wantTexts: []string{"*Bob*\n\nThanks"},
+		},
+		{
+			name:         "separator only with attachments sends them without caption",
+			content:      `\n\n--\n\n`,
+			attachments:  attachments,
+			wantCaptions: []string{"image:", "file:"},
+		},
+		{
+			name:         "empty content with attachments sends them without caption",
+			content:      ``,
+			attachments:  attachments,
+			wantCaptions: []string{"image:", "file:"},
+		},
+		{
+			// Control: a body rides on the first attachment only.
+			name:         "body with attachments captions the first one",
+			content:      `Thanks\n\n--\n\n`,
+			attachments:  attachments,
+			wantCaptions: []string{"image:*Bob*\n\nThanks", "file:"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := chatwootInReplyToID(tt.attrs); got != tt.want {
-				t.Fatalf("chatwootInReplyToID(%v) = %d, want %d", tt.attrs, got, tt.want)
+			// Signing is on: an empty body must not go out as a lone agent name.
+			withSignConfig(t, true, "\n\n")
+			prevDevice := config.ChatwootDeviceID
+			config.ChatwootDeviceID = "reply-device"
+			t.Cleanup(func() { config.ChatwootDeviceID = prevDevice })
+			chatwoot.InitClientRegistry(nil)
+			t.Cleanup(func() { chatwoot.InitClientRegistry(nil) })
+
+			manager := whatsapp.NewDeviceManager(nil, nil, nil)
+			manager.AddDevice(whatsapp.NewDeviceInstance("reply-device", nil, nil))
+			stub := &chatwootReplySendStub{}
+			handler := &ChatwootHandler{SendUsecase: stub, DeviceManager: manager}
+			app := fiber.New()
+			app.Post("/chatwoot/webhook", handler.HandleWebhook)
+
+			body := `{"event":"message_created","message_type":"outgoing","content":"` + tt.content + `",` +
+				`"sender":{"name":"Bob"},"account":{"id":1},` +
+				`"conversation":{"id":5,"inbox_id":9,"meta":{"sender":{"phone_number":"+628123456789"}}}`
+			if tt.attachments != "" {
+				body += `,"attachments":` + tt.attachments
+			}
+			body += `}`
+			withChatwootWebhookSecret(t, "reply-secret")
+			req := httptest.NewRequest(http.MethodPost, "/chatwoot/webhook", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Chatwoot-Webhook-Secret", "reply-secret")
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			if strings.Join(stub.texts, "|") != strings.Join(tt.wantTexts, "|") || len(stub.texts) != len(tt.wantTexts) {
+				t.Errorf("SendText messages = %q, want %q", stub.texts, tt.wantTexts)
+			}
+			if strings.Join(stub.captions, "|") != strings.Join(tt.wantCaptions, "|") || len(stub.captions) != len(tt.wantCaptions) {
+				t.Errorf("attachments sent = %q, want %q", stub.captions, tt.wantCaptions)
 			}
 		})
 	}
 }
 
-type chatwootReplyLinkTestRepo struct {
-	domainChatStorage.IChatStorageRepository
-	links map[int]*domainChatStorage.ChatwootMessageLink
-	err   error
-}
+// TestChatwootWebhookLegacyWithoutDeviceIDSendsFromOnlyDevice: the documented
+// single-device setup leaves CHATWOOT_DEVICE_ID empty. A reply to a new
+// conversation (no link yet) is sent from the only device.
+func TestChatwootWebhookLegacyWithoutDeviceIDSendsFromOnlyDevice(t *testing.T) {
+	withChatwootWebhookSecret(t, "legacy-secret")
+	prevDevice := config.ChatwootDeviceID
+	config.ChatwootDeviceID = ""
+	t.Cleanup(func() { config.ChatwootDeviceID = prevDevice })
+	chatwoot.InitClientRegistry(nil)
+	t.Cleanup(func() { chatwoot.InitClientRegistry(nil) })
 
-func (r *chatwootReplyLinkTestRepo) GetChatwootMessageLinkByChatwootID(deviceID string, chatwootMessageID int) (*domainChatStorage.ChatwootMessageLink, error) {
-	if r.err != nil {
-		return nil, r.err
+	manager := whatsapp.NewDeviceManager(nil, nil, nil)
+	manager.AddDevice(whatsapp.NewDeviceInstance("only-device", nil, nil))
+	stub := &chatwootReplySendStub{}
+	handler := &ChatwootHandler{SendUsecase: stub, DeviceManager: manager, ChatStorageRepo: &deviceWebhookTestRepo{}}
+	app := fiber.New()
+	app.Post("/chatwoot/webhook", handler.HandleWebhook)
+
+	body := `{"event":"message_created","message_type":"outgoing","content":"hello","account":{"id":1},` +
+		`"conversation":{"id":5,"inbox_id":9,"meta":{"sender":{"phone_number":"+628123456789"}}}}`
+	req := webhookAuthRequest{body: body, headers: map[string]string{"X-Chatwoot-Webhook-Secret": "legacy-secret"}}
+	if got := postChatwootWebhook(t, app, req); got != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", got)
 	}
-	return r.links[chatwootMessageID], nil
-}
-
-func TestResolveReplyMessageID(t *testing.T) {
-	repo := &chatwootReplyLinkTestRepo{
-		links: map[int]*domainChatStorage.ChatwootMessageLink{
-			42: {WhatsAppMessageID: "3EB0AAAA"},
-			43: {WhatsAppMessageID: ""},
-		},
+	if len(stub.texts) != 1 || stub.texts[0] != "hello" {
+		t.Fatalf("SendText messages = %q, want [\"hello\"]", stub.texts)
 	}
-	handler := &ChatwootHandler{ChatStorageRepo: repo}
-
-	payloadWithReply := func(v any) chatwoot.WebhookPayload {
-		return chatwoot.WebhookPayload{ContentAttributes: map[string]any{"in_reply_to": v}}
-	}
-
-	t.Run("linked quote resolves to whatsapp message id", func(t *testing.T) {
-		got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42)))
-		if got == nil || *got != "3EB0AAAA" {
-			t.Fatalf("expected 3EB0AAAA, got %v", got)
-		}
-	})
-
-	t.Run("unknown quote yields nil", func(t *testing.T) {
-		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(99))); got != nil {
-			t.Fatalf("expected nil, got %q", *got)
-		}
-	})
-
-	t.Run("link without whatsapp id yields nil", func(t *testing.T) {
-		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(43))); got != nil {
-			t.Fatalf("expected nil, got %q", *got)
-		}
-	})
-
-	t.Run("no quote yields nil", func(t *testing.T) {
-		if got := handler.resolveReplyMessageID("device-1", chatwoot.WebhookPayload{}); got != nil {
-			t.Fatalf("expected nil, got %q", *got)
-		}
-	})
-
-	t.Run("empty device id yields nil", func(t *testing.T) {
-		if got := handler.resolveReplyMessageID("", payloadWithReply(float64(42))); got != nil {
-			t.Fatalf("expected nil, got %q", *got)
-		}
-	})
-
-	t.Run("repo error yields nil", func(t *testing.T) {
-		errHandler := &ChatwootHandler{ChatStorageRepo: &chatwootReplyLinkTestRepo{err: errors.New("boom")}}
-		if got := errHandler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
-			t.Fatalf("expected nil, got %q", *got)
-		}
-	})
-
-	t.Run("nil repo yields nil", func(t *testing.T) {
-		nilHandler := &ChatwootHandler{}
-		if got := nilHandler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
-			t.Fatalf("expected nil, got %q", *got)
-		}
-	})
-}
-
-// withResolveQuotedSourceIDFn overrides the resolveQuotedSourceIDFn seam for
-// the duration of a subtest and restores the original on cleanup.
-func withResolveQuotedSourceIDFn(t *testing.T, fn func(conversationID, messageID int) (string, error)) {
-	t.Helper()
-	prev := resolveQuotedSourceIDFn
-	resolveQuotedSourceIDFn = fn
-	t.Cleanup(func() {
-		resolveQuotedSourceIDFn = prev
-	})
-}
-
-func TestResolveReplyMessageIDFallsBackToSourceID(t *testing.T) {
-	payloadWithReply := func(v any) chatwoot.WebhookPayload {
-		return chatwoot.WebhookPayload{
-			ContentAttributes: map[string]any{"in_reply_to": v},
-			Conversation:      chatwoot.ConversationWebhook{ID: 202},
-		}
-	}
-
-	t.Run("no local link falls back to source_id WAID prefix", func(t *testing.T) {
-		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
-			if conversationID != 202 || messageID != 42 {
-				t.Fatalf("unexpected args conversationID=%d messageID=%d", conversationID, messageID)
-			}
-			return "WAID:ABC123", nil
-		})
-
-		// No ChatStorageRepo => the local-link path is skipped entirely, so
-		// resolution must come from the fallback.
-		handler := &ChatwootHandler{}
-		got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42)))
-		if got == nil || *got != "ABC123" {
-			t.Fatalf("expected ABC123, got %v", got)
-		}
-	})
-
-	t.Run("local link miss falls back to source_id", func(t *testing.T) {
-		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
-			return "WAID:XYZ999", nil
-		})
-
-		repo := &chatwootReplyLinkTestRepo{links: map[int]*domainChatStorage.ChatwootMessageLink{}}
-		handler := &ChatwootHandler{ChatStorageRepo: repo}
-		got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42)))
-		if got == nil || *got != "XYZ999" {
-			t.Fatalf("expected XYZ999, got %v", got)
-		}
-	})
-
-	t.Run("local link hit takes priority over fallback", func(t *testing.T) {
-		fallbackCalled := false
-		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
-			fallbackCalled = true
-			return "WAID:SHOULD_NOT_BE_USED", nil
-		})
-
-		repo := &chatwootReplyLinkTestRepo{links: map[int]*domainChatStorage.ChatwootMessageLink{
-			42: {WhatsAppMessageID: "3EB0AAAA"},
-		}}
-		handler := &ChatwootHandler{ChatStorageRepo: repo}
-		got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42)))
-		if got == nil || *got != "3EB0AAAA" {
-			t.Fatalf("expected 3EB0AAAA, got %v", got)
-		}
-		if fallbackCalled {
-			t.Fatalf("fallback should not be called when a local link is found")
-		}
-	})
-
-	t.Run("source_id without WAID prefix yields nil", func(t *testing.T) {
-		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
-			return "12345", nil
-		})
-		handler := &ChatwootHandler{}
-		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
-			t.Fatalf("expected nil, got %q", *got)
-		}
-	})
-
-	t.Run("empty source_id yields nil", func(t *testing.T) {
-		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
-			return "", nil
-		})
-		handler := &ChatwootHandler{}
-		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
-			t.Fatalf("expected nil, got %q", *got)
-		}
-	})
-
-	t.Run("bare WAID prefix with empty id yields nil", func(t *testing.T) {
-		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
-			return "WAID:", nil
-		})
-		handler := &ChatwootHandler{}
-		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
-			t.Fatalf("expected nil, got %q", *got)
-		}
-	})
-
-	t.Run("fallback error yields nil", func(t *testing.T) {
-		withResolveQuotedSourceIDFn(t, func(conversationID, messageID int) (string, error) {
-			return "", errors.New("boom")
-		})
-		handler := &ChatwootHandler{}
-		if got := handler.resolveReplyMessageID("device-1", payloadWithReply(float64(42))); got != nil {
-			t.Fatalf("expected nil, got %q", *got)
-		}
-	})
 }
