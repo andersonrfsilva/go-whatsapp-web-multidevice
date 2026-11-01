@@ -447,17 +447,6 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 		oriImagePath   string
 	)
 
-	defer func() {
-		if len(deletedItems) == 0 {
-			return
-		}
-		go func() {
-			if errDelete := utils.RemoveFile(0, deletedItems...); errDelete != nil {
-				logrus.Warnf("SendImage: failed to delete temp files: %v", errDelete)
-			}
-		}()
-	}()
-
 	// Prefix every temp file with a UUID, as the video path already does.
 	// Without it two concurrent sends of the same filename share one path on
 	// disk and the deferred cleanup below deletes the other request's files.

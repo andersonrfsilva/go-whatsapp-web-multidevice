@@ -22,11 +22,6 @@ type Message struct {
 	MessageType string `json:"message_type"`
 	Private     bool   `json:"private"`
 	ContentType string `json:"content_type"`
-	// SourceID carries the external id the forwarder stamps on every mirrored
-	// WhatsApp message ("WAID:<whatsapp-message-id>"). It lets an agent reply
-	// resolve the quoted message back to its WhatsApp id even when no local
-	// link row exists (notably inbound contact messages).
-	SourceID string `json:"source_id"`
 }
 
 type CreateContactRequest struct {
