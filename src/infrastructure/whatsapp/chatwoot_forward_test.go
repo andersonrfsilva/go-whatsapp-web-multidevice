@@ -472,13 +472,17 @@ func (r *replyAttrsTestRepo) GetChatwootMessageLinkByWhatsAppID(deviceID, waMess
 func TestBuildChatwootReplyAttributes(t *testing.T) {
 	repo := &replyAttrsTestRepo{
 		links: map[string]*chatstorage.ChatwootMessageLink{
-			"device-1|wamid-linked":    {ChatwootMessageID: 77},
-			"device-1|wamid-zero-link": {ChatwootMessageID: 0},
+			"device-1|wamid-linked":         {ChatwootMessageID: 77},
+			"device-1|wamid-zero-link":      {ChatwootMessageID: 0},
+			"device-1|wamid-other-config":   {ChatwootMessageID: 78, ChatwootConfigID: 9},
+			"device-1|wamid-other-account":  {ChatwootMessageID: 79, ChatwootAccountID: 2},
+			"device-1|wamid-current-config": {ChatwootMessageID: 80, ChatwootConfigID: 5},
 		},
 	}
+	legacy := &chatwoot.Client{AccountID: 1}
 
 	t.Run("linked reply sets native in_reply_to", func(t *testing.T) {
-		attrs, linked := buildChatwootReplyAttributes("device-1", repo, "wamid-linked")
+		attrs, linked := buildChatwootReplyAttributes(legacy, 0, "device-1", repo, "wamid-linked")
 		if !linked {
 			t.Fatal("expected linked=true")
 		}
@@ -491,7 +495,7 @@ func TestBuildChatwootReplyAttributes(t *testing.T) {
 	})
 
 	t.Run("unlinked reply keeps only external id", func(t *testing.T) {
-		attrs, linked := buildChatwootReplyAttributes("device-1", repo, "wamid-unknown")
+		attrs, linked := buildChatwootReplyAttributes(legacy, 0, "device-1", repo, "wamid-unknown")
 		if linked {
 			t.Fatal("expected linked=false")
 		}
@@ -504,13 +508,42 @@ func TestBuildChatwootReplyAttributes(t *testing.T) {
 	})
 
 	t.Run("link with zero chatwoot id is not linked", func(t *testing.T) {
-		if _, linked := buildChatwootReplyAttributes("device-1", repo, "wamid-zero-link"); linked {
+		if _, linked := buildChatwootReplyAttributes(legacy, 0, "device-1", repo, "wamid-zero-link"); linked {
 			t.Fatal("expected linked=false for zero chatwoot message id")
 		}
 	})
 
+	// A link written for another Chatwoot destination must not supply
+	// in_reply_to: its message id belongs to that server/account.
+	t.Run("link from another destination is not linked", func(t *testing.T) {
+		cases := []struct {
+			id       string
+			configID int64
+		}{
+			{"wamid-other-config", 5},   // per-device client, link of another config
+			{"wamid-other-account", 0},  // legacy client, link of another account
+			{"wamid-current-config", 0}, // legacy client, per-device link
+		}
+		for _, tc := range cases {
+			attrs, linked := buildChatwootReplyAttributes(legacy, tc.configID, "device-1", repo, tc.id)
+			if linked {
+				t.Fatalf("%s: expected linked=false", tc.id)
+			}
+			if _, ok := attrs["in_reply_to"]; ok {
+				t.Fatalf("%s: in_reply_to must not be set from a foreign link", tc.id)
+			}
+		}
+	})
+
+	t.Run("link of the current config is linked", func(t *testing.T) {
+		attrs, linked := buildChatwootReplyAttributes(legacy, 5, "device-1", repo, "wamid-current-config")
+		if !linked || attrs["in_reply_to"] != 80 {
+			t.Fatalf("expected in_reply_to=80 linked, got %v linked=%v", attrs["in_reply_to"], linked)
+		}
+	})
+
 	t.Run("nil repo keeps only external id", func(t *testing.T) {
-		attrs, linked := buildChatwootReplyAttributes("device-1", nil, "wamid-linked")
+		attrs, linked := buildChatwootReplyAttributes(legacy, 0, "device-1", nil, "wamid-linked")
 		if linked {
 			t.Fatal("expected linked=false with nil repo")
 		}
@@ -520,7 +553,7 @@ func TestBuildChatwootReplyAttributes(t *testing.T) {
 	})
 
 	t.Run("empty device id keeps only external id", func(t *testing.T) {
-		if _, linked := buildChatwootReplyAttributes("", repo, "wamid-linked"); linked {
+		if _, linked := buildChatwootReplyAttributes(legacy, 0, "", repo, "wamid-linked"); linked {
 			t.Fatal("expected linked=false with empty device id")
 		}
 	})

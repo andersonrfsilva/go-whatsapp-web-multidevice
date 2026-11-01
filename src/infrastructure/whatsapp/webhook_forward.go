@@ -770,10 +770,14 @@ func buildChatwootMessageContent(data map[string]any, isGroup bool, fromName str
 		}
 	}
 
-	// Empty content with no attachments is left as-is: the caller skips the
-	// message instead of posting a placeholder. These payloads come from events
-	// that have no rendering in the WhatsApp chat either (poll votes, protocol
-	// messages), so a Chatwoot entry would appear next to nothing in WhatsApp.
+	// Handle empty content. Poll votes, edits and added options returned
+	// earlier with empty content so the caller skips them; anything else that
+	// is still empty here (e.g. media whose download failed, or media with only
+	// a remote URL) must still show up for the agent.
+	if content == "" && len(attachments) == 0 {
+		content = "(Unsupported message type)"
+		logrus.Info("Chatwoot: Message content is empty/unsupported, using placeholder")
+	}
 
 	// For group messages with attachments but no text, still prepend sender name
 	if prefixGroupSender && content == "" && len(attachments) > 0 {
@@ -863,9 +867,12 @@ func oneLineExcerpt(s string, maxRunes int) string {
 // quoted message carries a WAID source_id, i.e. contact messages mirrored by
 // the forwarder). Agent-authored messages have no WAID source_id, so when a
 // stored link maps the quoted WhatsApp id to a Chatwoot message id, the native
-// in_reply_to is set as well. Returns the attributes and whether a link
-// resolved (callers keep a quoted-text fallback only when it did not).
-func buildChatwootReplyAttributes(deviceID string, linkRepo domainChatStorage.IChatStorageRepository, repliedToID string) (map[string]any, bool) {
+// in_reply_to is set as well, but only from a link written for the current
+// Chatwoot destination (see chatwootLinkMatchesClient): a link left over from
+// another server/account carries a message id that means nothing here.
+// Returns the attributes and whether a link resolved (callers keep a
+// quoted-text fallback only when it did not).
+func buildChatwootReplyAttributes(cw *chatwoot.Client, configID int64, deviceID string, linkRepo domainChatStorage.IChatStorageRepository, repliedToID string) (map[string]any, bool) {
 	attrs := map[string]any{"in_reply_to_external_id": "WAID:" + repliedToID}
 	if linkRepo == nil || deviceID == "" {
 		return attrs, false
@@ -875,7 +882,7 @@ func buildChatwootReplyAttributes(deviceID string, linkRepo domainChatStorage.IC
 		logrus.Warnf("Chatwoot: Failed to resolve quoted message link for %s: %v", repliedToID, err)
 		return attrs, false
 	}
-	if link == nil || link.ChatwootMessageID == 0 {
+	if link == nil || link.ChatwootMessageID == 0 || !chatwootLinkMatchesClient(link, cw, configID) {
 		return attrs, false
 	}
 	attrs["in_reply_to"] = link.ChatwootMessageID
@@ -1766,7 +1773,7 @@ func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventNam
 			// messages), resolve the native in_reply_to via the message-link
 			// table so reactions to agent-authored messages (which carry no WAID
 			// source_id) also attach to the original in Chatwoot.
-			attrs, _ := buildChatwootReplyAttributes(deviceID, linkRepo, rid)
+			attrs, _ := buildChatwootReplyAttributes(cw, resolved.ConfigID, deviceID, linkRepo, rid)
 			msgOpts.ContentAttributes = attrs
 		}
 	case "message.edited", "message.revoked", "message.deleted":
@@ -1789,7 +1796,7 @@ func syncPayloadToChatwoot(ctx context.Context, payload map[string]any, eventNam
 			msgOpts.SourceID = "WAID:" + id
 		}
 		if rid, _ := data["replied_to_id"].(string); rid != "" {
-			attrs, linked := buildChatwootReplyAttributes(deviceID, linkRepo, rid)
+			attrs, linked := buildChatwootReplyAttributes(cw, resolved.ConfigID, deviceID, linkRepo, rid)
 			msgOpts.ContentAttributes = attrs
 			// Without a resolved link the quote will not render in Chatwoot
 			// (in_reply_to_external_id only matches WAID-stamped messages), so
